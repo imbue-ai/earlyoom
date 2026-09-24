@@ -77,3 +77,53 @@ jobs:
           cd /work
           make
     - run: git clean -dxff
+
+  # The real binary, gVisor's real /proc and a real memory limit: the kill
+  # order must follow the kernel badness, where the band's oom_score_adj beats
+  # a larger RSS. gVisor serves every oom_score as 0, so this is the case
+  # upstream earlyoom gets wrong; the control step checks that it still does,
+  # which proves the test can fail.
+  runsc-ordering:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    env:
+      # Keep at PINNED_GVISOR_RELEASE in the monorepo's
+      # libs/mngr_vps/imbue/mngr_vps/host_setup.py (the production pin).
+      GVISOR_RELEASE: "20260601"
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0 # "git describe", and the v1.9.0 tag for the control
+    - name: Install runsc
+      run: |
+        set -euxo pipefail
+        url="https://storage.googleapis.com/gvisor/releases/release/${GVISOR_RELEASE}/x86_64"
+        cd "$(mktemp -d)"
+        for f in runsc containerd-shim-runsc-v1; do
+          curl -fsSL --retry 3 --retry-all-errors -o "$f" "${url}/${f}"
+          curl -fsSL --retry 3 --retry-all-errors -o "${f}.sha512" "${url}/${f}.sha512"
+          sha512sum -c "${f}.sha512"
+        done
+        chmod a+rx runsc containerd-shim-runsc-v1
+        sudo mv runsc containerd-shim-runsc-v1 /usr/local/bin/
+        sudo /usr/local/bin/runsc install
+        sudo systemctl restart docker
+        docker run --rm --runtime=runsc busybox dmesg | grep 'Starting gVisor'
+    - name: Build the fork and upstream v1.9.0 (static)
+      run: |
+        set -euxo pipefail
+        CFLAGS=-static make earlyoom
+        mv earlyoom earlyoom-fork
+        git worktree add /tmp/upstream v1.9.0
+        (cd /tmp/upstream && CFLAGS=-static make earlyoom)
+        cp /tmp/upstream/earlyoom earlyoom-upstream
+    - name: Kill order follows the badness under runsc
+      run: >-
+        docker run --rm --runtime=runsc --memory=512m --memory-swap=512m --cap-add SYS_RESOURCE
+        -v "$PWD:/work:ro" python:3.12-slim
+        python3 /work/ci/runsc_ordering_test.py --earlyoom /work/earlyoom-fork --expect badness
+    - name: "Control: upstream v1.9.0 kills out of badness order under runsc"
+      run: >-
+        docker run --rm --runtime=runsc --memory=512m --memory-swap=512m --cap-add SYS_RESOURCE
+        -v "$PWD:/work:ro" python:3.12-slim
+        python3 /work/ci/runsc_ordering_test.py --earlyoom /work/earlyoom-upstream --expect not-badness
