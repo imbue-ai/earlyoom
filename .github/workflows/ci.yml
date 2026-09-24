@@ -26,10 +26,10 @@ jobs:
 
 # And also build in a number of docker containers of older
 # distributions
-    - name: Build and test in Debian Bullseye
+    - name: Build and test in Debian Trixie
       uses: addnab/docker-run-action@v3
       with:
-        image: debian:bullseye
+        image: debian:trixie
         options: -v ${{ github.workspace }}:/work
         run: |
           set -ex
