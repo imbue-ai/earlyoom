@@ -115,8 +115,9 @@ def main() -> int:
     )
     print("predicted order (badness KiB, pid, adj):", predicted, flush=True)
 
-    # The hog grows in small steps and pauses after each kill, so earlyoom
-    # picks one victim at a time.
+    # The hog grows in small steps and never pauses. earlyoom picks one victim
+    # at a time because it waits for each to exit, and the freed memory must
+    # be refilled before the next kill.
     hog_code = (
         "import time\n"
         "open('/proc/self/oom_score_adj','w').write('-1000')\n"
