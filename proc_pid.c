@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "globals.h"
@@ -72,4 +73,96 @@ bool parse_proc_pid_stat(pid_stat_t* out, int pid)
     // Terminate string at end of data
     buf[len] = 0;
     return parse_proc_pid_stat_buf(out, buf);
+}
+
+// Find the line of a /proc/$pid/status buffer that starts with `name`
+// (example: "VmRSS:") and return a pointer just past the name, or NULL if
+// there is no such line. The name must start a line, so that "VmRSS:" cannot
+// match inside another field.
+static const char* status_field(const char* buf, const char* name)
+{
+    size_t name_len = strlen(name);
+    const char* line = buf;
+    while (*line) {
+        if (strncmp(line, name, name_len) == 0) {
+            return line + name_len;
+        }
+        line = strchr(line, '\n');
+        if (line == NULL) {
+            return NULL;
+        }
+        line++;
+    }
+    return NULL;
+}
+
+// Parse the KiB value of the `name` line into `out`. An absent line leaves
+// `out` untouched and returns true; a line that does not hold a number
+// returns false.
+static bool parse_status_field_kib(const char* buf, const char* name, bool* present, long long* out)
+{
+    const char* val = status_field(buf, name);
+    *present = val != NULL;
+    if (val == NULL) {
+        return true;
+    }
+    char* end = NULL;
+    errno = 0;
+    long long parsed = strtoll(val, &end, 10);
+    if (errno != 0 || end == val) {
+        return false;
+    }
+    *out = parsed;
+    return true;
+}
+
+// Parse a buffer that contains the text from /proc/$pid/status. Example
+// excerpt:
+//   VmRSS:	    8240 kB
+//   VmPTE:	      64 kB
+//   VmSwap:	       0 kB
+// Returns false if one of these lines is present but does not parse.
+bool parse_proc_pid_status_buf(pid_status_t* out, const char* buf)
+{
+    pid_status_t res = { 0 };
+    bool present = false;
+    if (!parse_status_field_kib(buf, "VmRSS:", &res.has_VmRSS, &res.VmRSSkiB)) {
+        return false;
+    }
+    if (!parse_status_field_kib(buf, "VmSwap:", &present, &res.VmSwapkiB)) {
+        return false;
+    }
+    if (!parse_status_field_kib(buf, "VmPTE:", &present, &res.VmPTEkiB)) {
+        return false;
+    }
+    *out = res;
+    return true;
+}
+
+// Read and parse the status file at `path`. Returns true on success, false
+// on error (usually: the process is gone).
+bool parse_proc_pid_status_path(pid_status_t* out, const char* path)
+{
+    // A real /proc/$pid/status is about 1.5 KiB.
+    char buf[4096] = { 0 };
+    FILE* f = fopen(path, "r");
+    if (f == NULL) {
+        return false;
+    }
+    size_t len = fread(buf, 1, sizeof(buf) - 1, f);
+    bool read_error = ferror(f) || len == 0;
+    fclose(f);
+    if (read_error) {
+        return false;
+    }
+    buf[len] = 0;
+    return parse_proc_pid_status_buf(out, buf);
+}
+
+// Read and parse /proc/$pid/status. Returns true on success, false on error.
+bool parse_proc_pid_status(pid_status_t* out, int pid)
+{
+    char path[256] = { 0 };
+    snprintf(path, sizeof(path), "%s/%d/status", procdir_path, pid);
+    return parse_proc_pid_status_path(out, path);
 }

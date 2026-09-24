@@ -158,12 +158,26 @@ func extractCmdExitCode(err error) int {
 }
 
 type mockProcProcess struct {
-	pid         int
-	state       string // set to "R" when empty
-	oom_score   int
-	VmRSSkiB    int
-	comm        string
-	num_threads int // set to 1 when zero
+	pid           int
+	ppid          int    // set to 1 when zero
+	state         string // set to "R" when empty
+	oom_score     int
+	oom_score_adj int
+	VmRSSkiB      int
+	VmSwapkiB     int
+	VmPTEkiB      int
+	comm          string
+	num_threads   int // set to 1 when zero
+	// noMm omits the Vm* lines from status, like a kernel thread.
+	noMm bool
+	// zombieLeader makes the main thread a zombie (state Z, no Vm* lines,
+	// two threads) whose memory is only visible through a live thread's
+	// task/$tid/status.
+	zombieLeader bool
+	// gvisor writes status the way gVisor does: no VmSwap or VmPTE lines.
+	gvisor bool
+	// noAdj omits oom_score_adj.
+	noAdj bool
 }
 
 func (m *mockProcProcess) toProcinfo_t() (p C.procinfo_t) {
@@ -176,8 +190,29 @@ func (m *mockProcProcess) toProcinfo_t() (p C.procinfo_t) {
 	return p
 }
 
-func mockProc(t *testing.T, procs []mockProcProcess) {
-	mockProcdir, err := ioutil.TempDir("", t.Name())
+// statusContent renders /proc/$pid/status. Only the lines around the ones
+// earlyoom reads are included.
+func (m *mockProcProcess) statusContent(omitVm bool) string {
+	s := fmt.Sprintf("Name:\t%s\nState:\t%s\nPid:\t%d\nPPid:\t%d\n", m.comm, m.state, m.pid, m.ppid)
+	if !omitVm {
+		s += fmt.Sprintf("VmPeak:\t%d kB\nVmSize:\t%d kB\nVmHWM:\t%d kB\nVmRSS:\t%d kB\n",
+			m.VmRSSkiB*2, m.VmRSSkiB*2, m.VmRSSkiB, m.VmRSSkiB)
+		if !m.gvisor {
+			s += fmt.Sprintf("RssAnon:\t%d kB\nVmPTE:\t%d kB\nVmSwap:\t%d kB\n", m.VmRSSkiB, m.VmPTEkiB, m.VmSwapkiB)
+		}
+	}
+	s += fmt.Sprintf("Threads:\t%d\n", m.num_threads)
+	return s
+}
+
+func writeFile(t testing.TB, path string, content string) {
+	if err := ioutil.WriteFile(path, []byte(content), 0444); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mockProc(t testing.TB, procs []mockProcProcess) {
+	mockProcdir, err := ioutil.TempDir("", "mockproc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,6 +225,13 @@ func mockProc(t *testing.T, procs []mockProcProcess) {
 		if p.num_threads == 0 {
 			p.num_threads = 1
 		}
+		if p.ppid == 0 {
+			p.ppid = 1
+		}
+		if p.zombieLeader {
+			p.state = "Z"
+			p.num_threads = 2
+		}
 
 		pidDir := fmt.Sprintf("%s/%d", mockProcdir, int(p.pid))
 		if err := os.Mkdir(pidDir, 0755); err != nil {
@@ -199,34 +241,40 @@ func mockProc(t *testing.T, procs []mockProcProcess) {
 		//
 		// rss = 2nd field, in pages. The other fields are not used by earlyoom.
 		rss := p.VmRSSkiB * 1024 / os.Getpagesize()
-		content := []byte(fmt.Sprintf("1 %d 3 4 5 6 7\n", rss))
-		if err := ioutil.WriteFile(pidDir+"/statm", content, 0444); err != nil {
-			t.Fatal(err)
+		statRss := rss
+		if p.noMm || p.zombieLeader {
+			statRss = 0
 		}
+		writeFile(t, pidDir+"/statm", fmt.Sprintf("1 %d 3 4 5 6 7\n", statRss))
 		// stat
 		//
 		// Real /proc/pid/stat string for gnome-shell
-		template := "549077 (%s) S 547891 549077 549077 0 -1 4194560 245592 104 342 5 108521 28953 0 1 20 0 %d 0 4816953 5260238848 %d 18446744073709551615 94179647238144 94179647245825 140730757359824 0 0 0 0 16781312 17656 0 0 0 17 1 0 0 0 0 0 94179647252976 94179647254904 94179672109056 140730757367876 140730757367897 140730757367897 140730757369827 0\n"
-		content = []byte(fmt.Sprintf(template, p.comm, p.num_threads, rss))
-		if err := ioutil.WriteFile(pidDir+"/stat", content, 0444); err != nil {
-			t.Fatal(err)
+		template := "549077 (%s) %s %d 549077 549077 0 -1 4194560 245592 104 342 5 108521 28953 0 1 20 0 %d 0 4816953 5260238848 %d 18446744073709551615 94179647238144 94179647245825 140730757359824 0 0 0 0 16781312 17656 0 0 0 17 1 0 0 0 0 0 94179647252976 94179647254904 94179672109056 140730757367876 140730757367897 140730757367897 140730757369827 0\n"
+		writeFile(t, pidDir+"/stat", fmt.Sprintf(template, p.comm, p.state, p.ppid, p.num_threads, statRss))
+		// status
+		writeFile(t, pidDir+"/status", p.statusContent(p.noMm || p.zombieLeader))
+		if p.zombieLeader {
+			taskDir := fmt.Sprintf("%s/task/%d", pidDir, p.pid+1)
+			if err := os.MkdirAll(taskDir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(fmt.Sprintf("%s/task/%d", pidDir, p.pid), 0755); err != nil {
+				t.Fatal(err)
+			}
+			writeFile(t, fmt.Sprintf("%s/task/%d/status", pidDir, p.pid), p.statusContent(true))
+			live := p
+			live.state = "S"
+			writeFile(t, taskDir+"/status", live.statusContent(false))
 		}
 		// oom_score
-		content = []byte(fmt.Sprintf("%d\n", p.oom_score))
-		if err := ioutil.WriteFile(pidDir+"/oom_score", content, 0444); err != nil {
-			t.Fatal(err)
-		}
+		writeFile(t, pidDir+"/oom_score", fmt.Sprintf("%d\n", p.oom_score))
 		// oom_score_adj
-		if err := ioutil.WriteFile(pidDir+"/oom_score_adj", []byte("0\n"), 0444); err != nil {
-			t.Fatal(err)
+		if !p.noAdj {
+			writeFile(t, pidDir+"/oom_score_adj", fmt.Sprintf("%d\n", p.oom_score_adj))
 		}
 		// comm
-		if err := ioutil.WriteFile(pidDir+"/comm", []byte(p.comm+"\n"), 0444); err != nil {
-			t.Fatal(err)
-		}
+		writeFile(t, pidDir+"/comm", p.comm+"\n")
 		// cmdline
-		if err := ioutil.WriteFile(pidDir+"/cmdline", []byte("foo\000-bar\000-baz"), 0444); err != nil {
-			t.Fatal(err)
-		}
+		writeFile(t, pidDir+"/cmdline", "foo\000-bar\000-baz")
 	}
 }

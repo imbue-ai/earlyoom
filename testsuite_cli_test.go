@@ -107,6 +107,9 @@ func TestCli(t *testing.T) {
 		{args: []string{"--prefer", "MyProcess2"}, code: -1, stderrContains: "Preferring to kill", stdoutContains: memReport},
 		{args: []string{"--ignore-root-user"}, code: -1, stderrContains: "Processes owned by root will not be killed", stdoutContains: memReport},
 		{args: []string{"--sort-by-rss"}, code: -1, stderrContains: "Find process with the largest rss", stdoutContains: memReport},
+		// The startup self-check reports the victim ordering
+		{args: nil, code: -1, stderrContains: "victim ordering: kernel_badness\n", stdoutContains: memReport},
+		{args: []string{"--sort-by-rss"}, code: -1, stderrContains: "victim ordering: sort_by_rss\n", stdoutContains: memReport},
 		{args: []string{"-i"}, code: -1, stderrContains: "Option -i is ignored"},
 		// Extra arguments should error out
 		{args: []string{"xyz"}, code: 13, stderrContains: "extra argument not understood", stdoutEmpty: true},

@@ -21,10 +21,12 @@
 #include "meminfo.h"
 #include "msg.h"
 
-// Processes matching "--prefer REGEX" get OOM_SCORE_PREFER added to their oom_score
-#define OOM_SCORE_PREFER 300
-// Processes matching "--avoid REGEX" get OOM_SCORE_AVOID added to their oom_score
-#define OOM_SCORE_AVOID -300
+// Processes matching "--prefer REGEX" get ADJ_PREFER added to their oom_score_adj
+// when computing their badness. This is the weight --prefer had against
+// oom_score upstream.
+#define ADJ_PREFER 300
+// Processes matching "--avoid REGEX" get ADJ_AVOID added to their oom_score_adj
+#define ADJ_AVOID -300
 
 // Processes matching "--prefer REGEX" get VMRSS_PREFER added to their VmRSSkiB
 #define VMRSS_PREFER 3145728
@@ -80,7 +82,7 @@ static int process_mrelease(int pidfd, unsigned int flags) {
     return (int)syscall(SYS_process_mrelease, pidfd, flags);
 }
 
-static void notify_spawn_subprocess(const char* script, char* const argv[], const procinfo_t* victim, int timeout_ms)
+static void notify_spawn_subprocess(const poll_loop_args_t* args, const char* script, char* const argv[], const procinfo_t* victim, int timeout_ms)
 {
     // Prevent our SIGCHLD handler from reaping
     // children before we can
@@ -148,6 +150,19 @@ out_unblock:
         setenv("EARLYOOM_UID", uid_str, 1);
         setenv("EARLYOOM_NAME", victim->name, 1);
         setenv("EARLYOOM_CMDLINE", victim->cmdline, 1);
+
+        char num_str[UID_BUFSIZ] = { 0 };
+        if (victim->oom_score_adj != PROCINFO_FIELD_NOT_SET) {
+            snprintf(num_str, UID_BUFSIZ, "%d", victim->oom_score_adj);
+            setenv("EARLYOOM_OOM_SCORE_ADJ", num_str, 1);
+        }
+        snprintf(num_str, UID_BUFSIZ, "%lld", victim->badness_kib);
+        setenv("EARLYOOM_BADNESS_KIB", num_str, 1);
+        snprintf(num_str, UID_BUFSIZ, "%lld", victim->VmRSSkiB);
+        setenv("EARLYOOM_VMRSS_KIB", num_str, 1);
+        if (args) {
+            setenv("EARLYOOM_ORDERING", ordering_name(args->ordering), 1);
+        }
     }
 
     debug("%s: exec %s\n", __func__, script);
@@ -176,17 +191,17 @@ static void notify_dbus(const char* body)
         NULL
     };
     const char* dbus_send_path = "/usr/bin/dbus-send";
-    notify_spawn_subprocess(dbus_send_path, argv, NULL, 0);
+    notify_spawn_subprocess(NULL, dbus_send_path, argv, NULL, 0);
 }
 
 // "-N" option
-static void notify_ext(char* const script, const procinfo_t* victim)
+static void notify_ext(const poll_loop_args_t* args, char* const script, const procinfo_t* victim)
 {
     char* const argv[] = {
         script,
         NULL
     };
-    notify_spawn_subprocess(script, argv, victim, 0);
+    notify_spawn_subprocess(args, script, argv, victim, 0);
 }
 
 static void notify_process_killed(const poll_loop_args_t* args, const procinfo_t* victim)
@@ -219,7 +234,7 @@ static void notify_process_killed(const poll_loop_args_t* args, const procinfo_t
         notify_dbus(notif_args);
     }
     if (args->notify_ext) {
-        notify_ext(args->notify_ext, victim);
+        notify_ext(args, args->notify_ext, victim);
     }
 }
 
@@ -230,7 +245,7 @@ static void kill_process_prehook(const poll_loop_args_t* args, const procinfo_t*
         args->kill_process_prehook,
         NULL,
     };
-    notify_spawn_subprocess(args->kill_process_prehook, argv, victim, PREHOOK_STARTUP_SLEEP_MS);
+    notify_spawn_subprocess(args, args->kill_process_prehook, argv, victim, PREHOOK_STARTUP_SLEEP_MS);
 }
 
 // kill_release kills a process and calls process_mrelease to
@@ -348,14 +363,118 @@ out_close:
     return res;
 }
 
-// is_larger finds out if the process with pid `cur->pid` uses more memory
-// than our current `victim`.
-// In the process, it fills the `cur` structure. It does so lazily, meaning
-// it only fills the fields it needs to make a decision.
-bool is_larger(const poll_loop_args_t* args, const procinfo_t* victim, procinfo_t* cur)
+const char* ordering_name(ordering_t ordering)
 {
-    if (cur->pid <= 2) {
-        // Let's not kill init or kthreadd.
+    switch (ordering) {
+    case ORDERING_KERNEL_BADNESS:
+        return "kernel_badness";
+    case ORDERING_RSS_FALLBACK:
+        return "rss_fallback";
+    case ORDERING_SORT_BY_RSS:
+        return "sort_by_rss";
+    }
+    return "?";
+}
+
+// select_ordering is the startup self-check: it reads every input the kernel
+// badness needs, for earlyoom's own process. If any of them cannot be read,
+// the badness cannot be computed for anyone, so victims are chosen by RSS
+// alone. This never exits: under a supervisor, a restart loop would leave the
+// machine with no early shedding at all.
+ordering_t select_ordering(const meminfo_t* m)
+{
+    bool ok = true;
+    const int self = getpid();
+
+    int adj = 0;
+    int res = get_oom_score_adj(self, &adj);
+    if (res < 0) {
+        warn("ERROR: self-check: could not read %s/%d/oom_score_adj: %s\n", procdir_path, self, strerror(-res));
+        ok = false;
+    }
+    pid_status_t status = { 0 };
+    if (!parse_proc_pid_status(&status, self)) {
+        warn("ERROR: self-check: could not read or parse %s/%d/status\n", procdir_path, self);
+        ok = false;
+    } else if (!status.has_VmRSS) {
+        warn("ERROR: self-check: %s/%d/status has no VmRSS line\n", procdir_path, self);
+        ok = false;
+    }
+    if (m->MemTotalKiB <= 0) {
+        warn("ERROR: self-check: MemTotal in %s/meminfo is %lld\n", procdir_path, m->MemTotalKiB);
+        ok = false;
+    }
+    if (!ok) {
+        warn("ERROR: self-check failed, falling back to RSS-only victim ordering (oom_score_adj is ignored)\n");
+        return ORDERING_RSS_FALLBACK;
+    }
+    return ORDERING_KERNEL_BADNESS;
+}
+
+// adj_kib converts oom_score_adj points into KiB of badness the way the
+// kernel's oom_badness() does: one point is worth 1/1000 of RAM plus swap.
+static long long adj_kib(const meminfo_t* m, long long adj)
+{
+    return adj * (m->MemTotalKiB + m->SwapTotalKiB) / 1000;
+}
+
+// read_mm_status fills `out` from the mm of `pid`, finding it the way the
+// kernel's find_lock_task_mm() does: the thread-group leader's, or, when the
+// leader has exited (a zombie main thread), any live thread's. Returns false
+// if the process is gone or has no mm at all, which is what makes a kernel
+// thread. This holds inside a pid namespace, where pid 2 and its children are
+// ordinary processes.
+static bool read_mm_status(int pid, pid_status_t* out)
+{
+    if (!parse_proc_pid_status(out, pid)) {
+        return false;
+    }
+    if (out->has_VmRSS) {
+        return true;
+    }
+    // Room for procdir_path, the task directory and a d_name.
+    char path[2 * PATH_LEN] = { 0 };
+    snprintf(path, sizeof(path), "%s/%d/task", procdir_path, pid);
+    DIR* taskdir = opendir(path);
+    if (taskdir == NULL) {
+        return false;
+    }
+    bool found = false;
+    struct dirent* d = NULL;
+    while ((d = readdir(taskdir)) != NULL) {
+        if (!isnumeric(d->d_name)) {
+            continue;
+        }
+        snprintf(path, sizeof(path), "%s/%d/task/%s/status", procdir_path, pid, d->d_name);
+        if (parse_proc_pid_status_path(out, path) && out->has_VmRSS) {
+            found = true;
+            break;
+        }
+    }
+    closedir(taskdir);
+    return found;
+}
+
+// is_larger finds out if the process with pid `cur->pid` is a better victim
+// than our current `victim`.
+// In the process, it fills the `cur` structure.
+//
+// The score is the kernel's oom_badness() (mm/oom_kill.c), in KiB:
+//
+//   badness = VmRSS + VmSwap + VmPTE + oom_score_adj * (MemTotal + SwapTotal) / 1000
+//
+// It is computed here instead of read from /proc/$pid/oom_score because
+// gVisor serves oom_score as a constant 0, which would reduce the choice to
+// largest RSS and ignore oom_score_adj. On a Linux kernel it reproduces the
+// kernel's own ordering.
+bool is_larger(const poll_loop_args_t* args, const meminfo_t* m, const procinfo_t* victim, procinfo_t* cur)
+{
+    if (cur->pid == 1) {
+        // Let's not kill init (the kernel's is_global_init()). Inside a
+        // container, this is the container's init.
+        return false;
+    }
+    if (cur->pid == getpid()) {
         return false;
     }
 
@@ -373,7 +492,10 @@ bool is_larger(const poll_loop_args_t* args, const procinfo_t* victim, procinfo_
         }
     }
 
-    {
+    if (args->ordering == ORDERING_RSS_FALLBACK) {
+        // /proc/$pid/status failed the self-check, so use the rss from
+        // /proc/$pid/stat, like upstream. A process without memory (a kernel
+        // thread) has nothing to free.
         bool res = parse_proc_pid_stat(&cur->stat, cur->pid);
         if (!res) {
             debug("%s: pid %d: error reading stat\n", __func__, cur->pid);
@@ -381,26 +503,41 @@ bool is_larger(const poll_loop_args_t* args, const procinfo_t* victim, procinfo_
         }
         const long page_size = sysconf(_SC_PAGESIZE);
         cur->VmRSSkiB = cur->stat.rss * page_size / 1024;
-    }
-
-    // A pid is a kernel thread if it's pid or ppid is 2.
-    // At least that's what procs does:
-    // https://github.com/warmchang/procps/blob/d173f5d6db746e3f252a6182aa1906a292fc200f/library/readproc.c#L1325
-    //
-    // The check for pid == 2 has already been done at the top.
-    if (cur->stat.ppid == 2) {
-        return false;
+        if (cur->VmRSSkiB == 0) {
+            return false;
+        }
+    } else {
+        pid_status_t status = { 0 };
+        if (!read_mm_status(cur->pid, &status)) {
+            // Gone, or a kernel thread.
+            return false;
+        }
+        cur->VmRSSkiB = status.VmRSSkiB;
+        cur->VmSwapkiB = status.VmSwapkiB;
+        cur->VmPTEkiB = status.VmPTEkiB;
     }
 
     {
-        int res = get_oom_score(cur->pid);
+        int adj = 0;
+        int res = get_oom_score_adj(cur->pid, &adj);
         if (res < 0) {
-            debug("%s: pid %d: error reading oom_score: %s\n", __func__, cur->pid, strerror(-res));
-            return false;
+            debug("%s: pid %d: error reading oom_score_adj: %s\n", __func__, cur->pid, strerror(-res));
+            // The badness needs it. The RSS orderings do not, and in the
+            // fallback it may be unreadable for everyone.
+            if (args->ordering == ORDERING_KERNEL_BADNESS) {
+                return false;
+            }
+        } else {
+            cur->oom_score_adj = adj;
         }
-        cur->oom_score = res;
+    }
+    // Skip processes with oom_score_adj = -1000, like the
+    // kernel oom killer would.
+    if (cur->oom_score_adj == -1000) {
+        return false;
     }
 
+    int bonus_adj = 0;
     if ((args->prefer_regex || args->avoid_regex || args->ignore_regex)) {
         int res = get_comm(cur->pid, cur->name, sizeof(cur->name));
         if (res < 0) {
@@ -408,73 +545,37 @@ bool is_larger(const poll_loop_args_t* args, const procinfo_t* victim, procinfo_
             return false;
         }
         if (args->prefer_regex && regexec(args->prefer_regex, cur->name, (size_t)0, NULL, 0) == 0) {
-            if (args->sort_by_rss) {
-                cur->VmRSSkiB += VMRSS_PREFER;
-            } else {
-                cur->oom_score += OOM_SCORE_PREFER;
-            }
+            bonus_adj += ADJ_PREFER;
         }
         if (args->avoid_regex && regexec(args->avoid_regex, cur->name, (size_t)0, NULL, 0) == 0) {
-            if (args->sort_by_rss) {
-                cur->VmRSSkiB += VMRSS_AVOID;
-            } else {
-                cur->oom_score += OOM_SCORE_AVOID;
-            }
+            bonus_adj += ADJ_AVOID;
         }
         if (args->ignore_regex && regexec(args->ignore_regex, cur->name, (size_t)0, NULL, 0) == 0) {
             return false;
         }
     }
 
-    // find process with the largest rss
-    if (args->sort_by_rss) {
-        // Case 1: neither victim nor cur have rss=0 (zombie main thread).
-        // This is the usual case.
-        if (cur->VmRSSkiB > 0 && victim->VmRSSkiB > 0) {
-            if (cur->VmRSSkiB < victim->VmRSSkiB) {
-                return false;
-            }
-            if (cur->VmRSSkiB == victim->VmRSSkiB && cur->oom_score <= victim->oom_score) {
-                return false;
-            }
-        }
-        // Case 2: one (or both) have rss=0 (zombie main thread)
-        else {
-            if (cur->VmRSSkiB == 0) {
-                // only print the warning when the zombie is first seen, i.e. as "cur"
-                get_comm(cur->pid, cur->name, sizeof(cur->name));
-                warn("%s: pid %d \"%s\": rss=0 but oom_score=%d. Zombie main thread? Using oom_score for this process.\n",
-                    __func__, cur->pid, cur->name, cur->oom_score);
-            }
-            if (cur->oom_score < victim->oom_score) {
-                return false;
-            }
-            if (cur->oom_score == victim->oom_score && cur->VmRSSkiB <= victim->VmRSSkiB) {
-                return false;
-            }
-        }
+    if (args->ordering == ORDERING_KERNEL_BADNESS) {
+        cur->badness_kib = cur->VmRSSkiB + cur->VmSwapkiB + cur->VmPTEkiB
+            + adj_kib(m, (long long)cur->oom_score_adj + bonus_adj);
     } else {
-        /* find process with the largest oom_score */
-        if (cur->oom_score < victim->oom_score) {
-            return false;
+        // The RSS orderings keep upstream's fixed --prefer/--avoid bonus of
+        // 3 GiB: in the fallback, MemTotal may be the input that failed.
+        long long bonus_kib = 0;
+        if (bonus_adj > 0) {
+            bonus_kib = VMRSS_PREFER;
+        } else if (bonus_adj < 0) {
+            bonus_kib = VMRSS_AVOID;
         }
-
-        if (cur->oom_score == victim->oom_score && cur->VmRSSkiB <= victim->VmRSSkiB) {
-            return false;
-        }
+        cur->badness_kib = cur->VmRSSkiB + bonus_kib;
     }
 
-    // Skip processes with oom_score_adj = -1000, like the
-    // kernel oom killer would.
-    {
-        int res = get_oom_score_adj(cur->pid, &cur->oom_score_adj);
-        if (res < 0) {
-            debug("%s: pid %d: error reading oom_score_adj: %s\n", __func__, cur->pid, strerror(-res));
-            return false;
-        }
-        if (cur->oom_score_adj == -1000) {
-            return false;
-        }
+    if (cur->badness_kib < victim->badness_kib) {
+        return false;
+    }
+    // Tie-break on RSS.
+    if (cur->badness_kib == victim->badness_kib && cur->VmRSSkiB <= victim->VmRSSkiB) {
+        return false;
     }
     return true;
 }
@@ -503,6 +604,16 @@ void fill_informative_fields(procinfo_t* cur)
             cur->uid = res;
         }
     }
+    // Not used for the decision, but worth logging: gVisor serves a
+    // constant 0 here.
+    if (cur->oom_score == PROCINFO_FIELD_NOT_SET) {
+        int res = get_oom_score(cur->pid);
+        if (res < 0) {
+            debug("%s: pid %d: error reading oom_score: %s\n", __func__, cur->pid, strerror(-res));
+        } else {
+            cur->oom_score = res;
+        }
+    }
 }
 
 // debug_print_procinfo pretty-prints the process information in `cur`.
@@ -512,19 +623,19 @@ void debug_print_procinfo(procinfo_t* cur)
         return;
     }
     fill_informative_fields(cur);
-    debug("%5d %9d %7lld %5d %13d \"%s\"",
-        cur->pid, cur->oom_score, cur->VmRSSkiB, cur->uid, cur->oom_score_adj, cur->name);
+    debug("%5d %11lld %7lld %5d %13d \"%s\"",
+        cur->pid, cur->badness_kib, cur->VmRSSkiB, cur->uid, cur->oom_score_adj, cur->name);
 }
 
 void debug_print_procinfo_header()
 {
-    debug("  PID OOM_SCORE  RSSkiB   UID OOM_SCORE_ADJ  COMM\n");
+    debug("  PID BADNESSkiB  RSSkiB   UID OOM_SCORE_ADJ  COMM\n");
 }
 
 /*
- * Find the process with the largest oom_score or rss(when flag --sort-by-rss is set).
+ * Find the process with the largest badness (see is_larger()).
  */
-procinfo_t find_largest_process(const poll_loop_args_t* args)
+procinfo_t find_largest_process(const poll_loop_args_t* args, const meminfo_t* m)
 {
     DIR* procdir = opendir(procdir_path);
     if (procdir == NULL) {
@@ -544,6 +655,8 @@ procinfo_t find_largest_process(const poll_loop_args_t* args)
         .oom_score = PROCINFO_FIELD_NOT_SET,
         .oom_score_adj = PROCINFO_FIELD_NOT_SET,
         .VmRSSkiB = PROCINFO_FIELD_NOT_SET,
+        // Badness can be negative (oom_score_adj < 0), so anything beats this.
+        .badness_kib = LLONG_MIN,
         /* omitted fields are set to zero */
     };
 
@@ -565,7 +678,7 @@ procinfo_t find_largest_process(const poll_loop_args_t* args)
         procinfo_t cur = empty_procinfo;
         cur.pid = (int)strtol(d->d_name, NULL, 10);
 
-        bool larger = is_larger(args, &victim, &cur);
+        bool larger = is_larger(args, m, &victim, &cur);
 
         debug_print_procinfo(&cur);
 
@@ -582,13 +695,6 @@ procinfo_t find_largest_process(const poll_loop_args_t* args)
         clock_gettime(CLOCK_MONOTONIC, &t1);
         long delta = (t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_nsec - t0.tv_nsec) / 1000;
         debug("selecting victim took %ld.%03ld ms\n", delta / 1000, delta % 1000);
-    }
-
-    if (victim.pid == getpid()) {
-        warn("%s: selected myself (pid %d). Do you use hidpid? See https://github.com/rfjakob/earlyoom/wiki/proc-hidepid\n",
-            __func__, victim.pid);
-        // zero victim struct
-        victim = (const procinfo_t) { 0 };
     }
 
     if (victim.pid >= 0) {
@@ -624,9 +730,12 @@ void kill_process(const poll_loop_args_t* args, int sig, const procinfo_t* victi
     }
     // sig == 0 is used as a self-test during startup. Don't notify the user.
     if (sig != 0 || enable_debug) {
-        warn("sending %s to process %d uid %d \"%s\": oom_score %d, oom_score_adj %d, VmRSS %lld MiB, cmdline \"%s\"\n",
-            sig_name, victim->pid, victim->uid, victim->name, victim->oom_score, victim->oom_score_adj, victim->VmRSSkiB / 1024,
-            victim->cmdline);
+        if (sig != 0 && args->ordering == ORDERING_RSS_FALLBACK) {
+            warn("ERROR: victim chosen by RSS alone (ordering rss_fallback): the startup self-check could not read the badness inputs\n");
+        }
+        warn("sending %s to process %d uid %d \"%s\": oom_score %d, oom_score_adj %d, badness %lld KiB, VmRSS %lld MiB, ordering %s, cmdline \"%s\"\n",
+            sig_name, victim->pid, victim->uid, victim->name, victim->oom_score, victim->oom_score_adj, victim->badness_kib,
+            victim->VmRSSkiB / 1024, ordering_name(args->ordering), victim->cmdline);
     }
 
     // Invoke program BEFORE killing a process. There is a small risk that there
