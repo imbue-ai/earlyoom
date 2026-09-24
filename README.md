@@ -21,6 +21,51 @@ In the user space, however, we can do whatever we want.
 earlyoom wants to be simple and solid. It is written in pure C with no dependencies.
 An extensive test suite (unit- and integration tests) is written in Go.
 
+The imbue-ai fork
+-----------------
+This is [imbue-ai](https://github.com/imbue-ai)'s fork of earlyoom v1.9.0,
+released as `v1.9.0-imbue.N`. It exists because
+[gVisor](https://gvisor.dev) serves `/proc/<pid>/oom_score` as a constant 0
+(it stores `oom_score_adj` but never uses it,
+[gvisor#1967](https://github.com/google/gvisor/issues/1967)). Upstream earlyoom
+picks the highest `oom_score`, so under gVisor it falls back to the largest
+RSS and ignores `oom_score_adj` entirely. Keeping in sync with upstream is not
+a goal.
+
+**Scoring.** The victim is the process with the highest kernel badness,
+computed the way `oom_badness()` in `mm/oom_kill.c` does, in KiB:
+
+    badness = VmRSS + VmSwap + VmPTE + oom_score_adj * (MemTotal + SwapTotal) / 1000
+
+The memory counters come from `/proc/<pid>/status` (a missing `VmSwap` or
+`VmPTE` counts as 0, which is what gVisor serves) and the totals from
+`/proc/meminfo`. This applies everywhere, with no gVisor detection; on a Linux
+kernel it reproduces the kernel's own `oom_score` ordering. `--prefer` and
+`--avoid` are worth +300 and -300 points of `oom_score_adj`, the weight they
+had against `oom_score`. Processes at `oom_score_adj` -1000 are never picked.
+Kernel threads are recognised by having no mm (no `VmRSS` line), not by pid:
+inside a pid namespace, pid 2 and its children are ordinary processes. pid 1
+and earlyoom itself are never picked.
+
+**Ordering modes.** At startup earlyoom reads its own `oom_score_adj` and
+`VmRSS`, and `MemTotal`, and logs `victim ordering: <mode>`:
+
+* `kernel_badness`: the scoring above.
+* `rss_fallback`: one of those inputs could not be read, so victims are chosen
+  by RSS alone. earlyoom logs an ERROR naming the input at startup and another
+  on every kill, and keeps running rather than exiting.
+* `sort_by_rss`: `--sort-by-rss` was passed.
+
+**`-N` hook.** Besides `EARLYOOM_PID`, `EARLYOOM_UID`, `EARLYOOM_NAME` and
+`EARLYOOM_CMDLINE`, the hook gets `EARLYOOM_OOM_SCORE_ADJ`,
+`EARLYOOM_BADNESS_KIB`, `EARLYOOM_VMRSS_KIB` and `EARLYOOM_ORDERING` (the mode
+above). The kill log line also carries the badness and the ordering.
+
+**Releases.** A `v*` tag publishes static binaries for
+`earlyoom-x86_64-unknown-linux` and `earlyoom-aarch64-unknown-linux`, each with
+a `.sha256`. CI also runs the binary under gVisor (`runsc`) with a memory limit
+and checks that the kill order follows the badness.
+
 What does it do
 ---------------
 earlyoom checks the amount of available memory and free swap up to 10
