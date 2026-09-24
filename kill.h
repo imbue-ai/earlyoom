@@ -12,10 +12,10 @@ typedef enum {
     // The kernel's oom_badness(), computed from oom_score_adj and the
     // memory counters in /proc/$pid/status
     ORDERING_KERNEL_BADNESS = 0,
-    // Largest RSS, because the startup self-check could not read an input
-    // of the badness
-    ORDERING_RSS_FALLBACK,
-    // Largest RSS, because --sort-by-rss was passed
+    // Upstream earlyoom's ordering (oom_score, or rss with --sort-by-rss),
+    // because the startup self-check could not read an input of the badness
+    ORDERING_UPSTREAM_FALLBACK,
+    // Upstream earlyoom's --sort-by-rss ordering, because it was passed
     ORDERING_SORT_BY_RSS,
 } ordering_t;
 
@@ -36,6 +36,8 @@ typedef struct {
     bool kill_process_group;
     /* do not kill processes owned by root */
     bool ignore_root_user;
+    /* find process with the largest rss */
+    bool sort_by_rss;
     /* prefer/avoid killing these processes. NULL = no-op. */
     regex_t* prefer_regex;
     regex_t* avoid_regex;

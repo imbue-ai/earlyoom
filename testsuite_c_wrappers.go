@@ -60,15 +60,16 @@ func parse_meminfo() C.meminfo_t {
 }
 
 const (
-	orderingKernelBadness = C.ORDERING_KERNEL_BADNESS
-	orderingRssFallback   = C.ORDERING_RSS_FALLBACK
-	orderingSortByRss     = C.ORDERING_SORT_BY_RSS
+	orderingKernelBadness    = C.ORDERING_KERNEL_BADNESS
+	orderingUpstreamFallback = C.ORDERING_UPSTREAM_FALLBACK
+	orderingSortByRss        = C.ORDERING_SORT_BY_RSS
 )
 
 // Wrapper so _test.go code can create a poll_loop_args_t
 // struct. _test.go code cannot use C.
 func poll_loop_args_t(ordering C.ordering_t) (args C.poll_loop_args_t) {
 	args.ordering = ordering
+	args.sort_by_rss = C.bool(ordering == C.ORDERING_SORT_BY_RSS)
 	return
 }
 

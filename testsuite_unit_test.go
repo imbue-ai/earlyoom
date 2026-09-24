@@ -480,24 +480,8 @@ func Test_is_larger_zombie_main_thread(t *testing.T) {
 	}
 }
 
-// earlyoom never picks itself, however large it looks.
-func Test_is_larger_skips_self(t *testing.T) {
-	procs := []mockProcProcess{
-		{pid: os.Getpid(), VmRSSkiB: 900000, oom_score_adj: 1000},
-		{pid: 100, VmRSSkiB: 5000},
-	}
-	mockProc(t, procs)
-	defer procdir_path("/proc")
-
-	args := poll_loop_args_t(orderingKernelBadness)
-	m := meminfo_t(testMemTotalKiB, 0)
-	if v := find_largest_process_with(&args, &m); v.pid != 100 {
-		t.Errorf("victim want=100 have=%d", v.pid)
-	}
-}
-
-// The startup self-check picks rss_fallback when an input of the badness
-// cannot be read, and the fallback then orders by RSS alone.
+// The startup self-check picks upstream_fallback when an input of the badness
+// cannot be read.
 func Test_select_ordering(t *testing.T) {
 	self := os.Getpid()
 	tcs := []struct {
@@ -508,9 +492,9 @@ func Test_select_ordering(t *testing.T) {
 	}{
 		{"all readable", mockProcProcess{pid: self, VmRSSkiB: 1000}, meminfo_t(testMemTotalKiB, 0), orderingKernelBadness},
 		{"gVisor status", mockProcProcess{pid: self, VmRSSkiB: 1000, gvisor: true}, meminfo_t(testMemTotalKiB, 0), orderingKernelBadness},
-		{"unreadable adj", mockProcProcess{pid: self, VmRSSkiB: 1000, noAdj: true}, meminfo_t(testMemTotalKiB, 0), orderingRssFallback},
-		{"no VmRSS", mockProcProcess{pid: self, noMm: true}, meminfo_t(testMemTotalKiB, 0), orderingRssFallback},
-		{"no MemTotal", mockProcProcess{pid: self, VmRSSkiB: 1000}, meminfo_t(0, 0), orderingRssFallback},
+		{"unreadable adj", mockProcProcess{pid: self, VmRSSkiB: 1000, noAdj: true}, meminfo_t(testMemTotalKiB, 0), orderingUpstreamFallback},
+		{"no VmRSS", mockProcProcess{pid: self, noMm: true}, meminfo_t(testMemTotalKiB, 0), orderingUpstreamFallback},
+		{"no MemTotal", mockProcProcess{pid: self, VmRSSkiB: 1000}, meminfo_t(0, 0), orderingUpstreamFallback},
 	}
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
@@ -524,73 +508,104 @@ func Test_select_ordering(t *testing.T) {
 	}
 }
 
-func Test_is_larger_rss_fallback(t *testing.T) {
+// The upstream orderings are upstream's is_larger() unchanged, so these are
+// upstream's tests.
+func Test_is_larger(t *testing.T) {
 	procs := []mockProcProcess{
 		// smallest
-		{pid: 100, VmRSSkiB: 4000, oom_score_adj: 1000},
-		{pid: 101, VmRSSkiB: 8000, noAdj: true},
-		{pid: 102, VmRSSkiB: 12000},
+		{pid: 100, oom_score: 100, VmRSSkiB: 1234},
+		{pid: 101, oom_score: 100, VmRSSkiB: 1238},
+		{pid: 102, oom_score: 101, VmRSSkiB: 4},
+		{pid: 103, oom_score: 102, VmRSSkiB: 4},
+		{pid: 104, oom_score: 103, VmRSSkiB: 0, num_threads: 2}, // zombie main thread
 		// largest
 	}
+
 	mockProc(t, procs)
 	defer procdir_path("/proc")
+	t.Logf("procdir_path=%q", procdir_path(""))
 
-	args := poll_loop_args_t(orderingRssFallback)
+	args := poll_loop_args_t(orderingUpstreamFallback)
 	m := meminfo_t(testMemTotalKiB, 0)
 	permute_is_larger(t, &args, &m, procs)
 }
 
-func Test_is_larger_sort_by_rss(t *testing.T) {
+func Test_is_larger_by_rss(t *testing.T) {
 	procs := []mockProcProcess{
 		// smallest
-		{pid: 100, VmRSSkiB: 4000, oom_score_adj: 1000},
-		{pid: 101, VmRSSkiB: 8000},
-		{pid: 102, VmRSSkiB: 12000, VmSwapkiB: 1000000},
+		{pid: 100, oom_score: 100, VmRSSkiB: 4},
+		{pid: 101, oom_score: 100, VmRSSkiB: 8},
+		{pid: 102, oom_score: 101, VmRSSkiB: 8},
+		{pid: 103, oom_score: 99, VmRSSkiB: 12},
+		{pid: 104, oom_score: 102, VmRSSkiB: 0, num_threads: 2}, // zombie main thread
+		{pid: 105, oom_score: 102, VmRSSkiB: 12},
 		// largest
 	}
+
 	mockProc(t, procs)
 	defer procdir_path("/proc")
+	t.Logf("procdir_path=%q", procdir_path(""))
 
 	args := poll_loop_args_t(orderingSortByRss)
 	m := meminfo_t(testMemTotalKiB, 0)
 	permute_is_larger(t, &args, &m, procs)
 }
 
-// The -N hook gets the victim's adj, badness, RSS and the ordering in its
-// environment.
+// The -N hook gets the victim's adj, RSS and the ordering in its environment,
+// and the badness when that is what chose the victim.
 func Test_notify_ext_environment(t *testing.T) {
-	dir := t.TempDir()
-	out := dir + "/env"
-	script := dir + "/hook.sh"
-	writeFile(t, script, "#!/bin/sh\nenv > "+out+".tmp && mv "+out+".tmp "+out+"\n")
-	if err := os.Chmod(script, 0755); err != nil {
-		t.Fatal(err)
-	}
-
 	victim := victimInfo{pid: 4242, oomScoreAdj: 900, badnessKiB: 920000, vmRssKiB: 20000}
-	kill_process_dryrun_notify(orderingKernelBadness, script, victim, "pytest")
-
-	var content []byte
-	for i := 0; i < 100; i++ {
-		var err error
-		content, err = ioutil.ReadFile(out)
-		if err == nil {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	env := string(content)
-	for _, want := range []string{
+	common := []string{
 		"EARLYOOM_PID=4242\n",
 		"EARLYOOM_NAME=pytest\n",
 		"EARLYOOM_OOM_SCORE_ADJ=900\n",
-		"EARLYOOM_BADNESS_KIB=920000\n",
 		"EARLYOOM_VMRSS_KIB=20000\n",
-		"EARLYOOM_ORDERING=kernel_badness\n",
-	} {
-		if !strings.Contains(env, want) {
-			t.Errorf("hook environment lacks %q:\n%s", want, env)
+	}
+	tcs := []struct {
+		ordering _Ctype_ordering_t
+		want     []string
+		absent   []string
+	}{
+		{orderingKernelBadness, []string{"EARLYOOM_BADNESS_KIB=920000\n", "EARLYOOM_ORDERING=kernel_badness\n"}, nil},
+		{orderingUpstreamFallback, []string{"EARLYOOM_ORDERING=upstream_fallback\n"}, []string{"EARLYOOM_BADNESS_KIB="}},
+	}
+	for i, tc := range tcs {
+		if i > 0 {
+			// --dryrun runs the hook at most once per second.
+			time.Sleep(1100 * time.Millisecond)
 		}
+		t.Run(ordering_name(tc.ordering), func(t *testing.T) {
+			dir := t.TempDir()
+			out := dir + "/env"
+			script := dir + "/hook.sh"
+			writeFile(t, script, "#!/bin/sh\nenv > "+out+".tmp && mv "+out+".tmp "+out+"\n")
+			if err := os.Chmod(script, 0755); err != nil {
+				t.Fatal(err)
+			}
+
+			kill_process_dryrun_notify(tc.ordering, script, victim, "pytest")
+
+			var content []byte
+			for i := 0; i < 100; i++ {
+				var err error
+				content, err = ioutil.ReadFile(out)
+				if err == nil {
+					break
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			env := string(content)
+			for _, want := range append(common, tc.want...) {
+				if !strings.Contains(env, want) {
+					t.Errorf("hook environment lacks %q:\n%s", want, env)
+				}
+			}
+			for _, absent := range tc.absent {
+				if strings.Contains(env, absent) {
+					t.Errorf("hook environment has %q:\n%s", absent, env)
+				}
+			}
+		})
 	}
 }
 

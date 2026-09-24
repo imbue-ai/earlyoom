@@ -30,7 +30,8 @@ released as `v1.9.0-imbue.N`. It exists because
 [gvisor#1967](https://github.com/google/gvisor/issues/1967)). Upstream earlyoom
 picks the highest `oom_score`, so under gVisor it falls back to the largest
 RSS and ignores `oom_score_adj` entirely. Keeping in sync with upstream is not
-a goal.
+a goal, but the fork changes only what the badness needs: `--sort-by-rss` and
+the fallback below run upstream's victim selection unchanged.
 
 **Scoring.** The victim is the process with the highest kernel badness,
 computed the way `oom_badness()` in `mm/oom_kill.c` does, in KiB:
@@ -45,21 +46,24 @@ kernel it reproduces the kernel's own `oom_score` ordering. `--prefer` and
 had against `oom_score`. Processes at `oom_score_adj` -1000 are never picked.
 Kernel threads are recognised by having no mm (no `VmRSS` line), not by pid:
 inside a pid namespace, pid 2 and its children are ordinary processes. pid 1
-and earlyoom itself are never picked.
+is never picked, and, as upstream, earlyoom never kills itself.
 
 **Ordering modes.** At startup earlyoom reads its own `oom_score_adj` and
 `VmRSS`, and `MemTotal`, and logs `victim ordering: <mode>`:
 
 * `kernel_badness`: the scoring above.
-* `rss_fallback`: one of those inputs could not be read, so victims are chosen
-  by RSS alone. earlyoom logs an ERROR naming the input at startup and another
-  on every kill, and keeps running rather than exiting.
-* `sort_by_rss`: `--sort-by-rss` was passed.
+* `upstream_fallback`: one of those inputs could not be read, so victims are
+  chosen exactly as upstream earlyoom v1.9.0 chooses them (by `oom_score`,
+  which under gVisor means by RSS). earlyoom logs an ERROR naming the input at
+  startup and another on every kill, and keeps running rather than exiting.
+* `sort_by_rss`: `--sort-by-rss` was passed; upstream's `--sort-by-rss`
+  selection, unchanged.
 
 **`-N` hook.** Besides `EARLYOOM_PID`, `EARLYOOM_UID`, `EARLYOOM_NAME` and
 `EARLYOOM_CMDLINE`, the hook gets `EARLYOOM_OOM_SCORE_ADJ`,
-`EARLYOOM_BADNESS_KIB`, `EARLYOOM_VMRSS_KIB` and `EARLYOOM_ORDERING` (the mode
-above). The kill log line also carries the badness and the ordering.
+`EARLYOOM_VMRSS_KIB` and `EARLYOOM_ORDERING` (the mode above), plus
+`EARLYOOM_BADNESS_KIB` under `kernel_badness`. Under `kernel_badness` the kill
+log line also carries the badness and the ordering; otherwise it is upstream's.
 
 **Releases.** A `v*` tag publishes static binaries for
 `earlyoom-x86_64-unknown-linux` and `earlyoom-aarch64-unknown-linux`, each with

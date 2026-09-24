@@ -140,10 +140,10 @@ int main(int argc, char* argv[])
         .swap_kill_percent = 5,
         .report_interval_ms = 1000,
         .ignore_root_user = false,
+        .sort_by_rss = false,
         /* omitted fields are set to zero */
     };
     int set_my_priority = 0;
-    bool sort_by_rss = false;
     char* prefer_cmds = NULL;
     char* avoid_cmds = NULL;
     char* ignore_cmds = NULL;
@@ -282,7 +282,7 @@ int main(int argc, char* argv[])
             fprintf(stderr, "Processes owned by root will not be killed\n");
             break;
         case LONG_OPT_SORT_BY_RSS:
-            sort_by_rss = true;
+            args.sort_by_rss = true;
             fprintf(stderr, "Find process with the largest rss\n");
             break;
         case LONG_OPT_PREFER:
@@ -410,7 +410,7 @@ int main(int argc, char* argv[])
     }
 
     args.ordering = select_ordering(&m);
-    if (sort_by_rss && args.ordering == ORDERING_KERNEL_BADNESS) {
+    if (args.sort_by_rss && args.ordering == ORDERING_KERNEL_BADNESS) {
         args.ordering = ORDERING_SORT_BY_RSS;
     }
     fprintf(stderr, "victim ordering: %s\n", ordering_name(args.ordering));
