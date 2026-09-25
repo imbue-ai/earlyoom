@@ -29,6 +29,10 @@ typedef struct procinfo {
     int oom_score;
     int oom_score_adj;
     long long VmRSSkiB;
+    long long VmSwapkiB;
+    long long VmPTEkiB;
+    // The kernel's oom_badness() in KiB, see is_larger()
+    long long badness_kib;
     pid_stat_t stat;
     char name[PATH_LEN];
     char cmdline[PATH_LEN];

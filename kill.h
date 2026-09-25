@@ -7,6 +7,18 @@
 
 #include "meminfo.h"
 
+// How the victim is chosen. See select_ordering() and is_larger().
+typedef enum {
+    // The kernel's oom_badness(), computed from oom_score_adj and the
+    // memory counters in /proc/$pid/status
+    ORDERING_KERNEL_BADNESS = 0,
+    // Upstream earlyoom's ordering (oom_score, or rss with --sort-by-rss),
+    // because the startup self-check could not read an input of the badness
+    ORDERING_UPSTREAM_FALLBACK,
+    // Upstream earlyoom's --sort-by-rss ordering, because it was passed
+    ORDERING_SORT_BY_RSS,
+} ordering_t;
+
 typedef struct {
     /* if the available memory AND swap goes below these percentages,
      * we start killing processes */
@@ -35,10 +47,14 @@ typedef struct {
     int report_interval_ms;
     /* Flag --dryrun was passed */
     bool dryrun;
+    /* how the victim is chosen */
+    ordering_t ordering;
 } poll_loop_args_t;
 
 void kill_process(const poll_loop_args_t* args, int sig, const procinfo_t* victim);
-procinfo_t find_largest_process(const poll_loop_args_t* args);
-bool is_larger(const poll_loop_args_t* args, const procinfo_t* victim, procinfo_t* cur);
+procinfo_t find_largest_process(const poll_loop_args_t* args, const meminfo_t* m);
+bool is_larger(const poll_loop_args_t* args, const meminfo_t* m, const procinfo_t* victim, procinfo_t* cur);
+ordering_t select_ordering(const meminfo_t* m);
+const char* ordering_name(ordering_t ordering);
 
 #endif

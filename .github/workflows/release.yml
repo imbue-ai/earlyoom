@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux
+            runner: ubuntu-24.04
+          - triple: aarch64-unknown-linux
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # VERSION comes from "git describe"
+      - name: Build a static binary
+        run: |
+          set -euxo pipefail
+          CFLAGS=-static make earlyoom
+          # The startup line must carry the tag, e.g. "earlyoom v1.9.0-imbue.1".
+          ./earlyoom -v 2>&1 | grep -Fx "earlyoom ${GITHUB_REF_NAME}"
+          file earlyoom | grep 'statically linked'
+          mkdir -p dist
+          cp earlyoom "dist/earlyoom-${{ matrix.triple }}"
+          ( cd dist && sha256sum "earlyoom-${{ matrix.triple }}" > "earlyoom-${{ matrix.triple }}.sha256" )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: earlyoom-${{ matrix.triple }}
+          path: dist/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/earlyoom-x86_64-unknown-linux
+            dist/earlyoom-x86_64-unknown-linux.sha256
+            dist/earlyoom-aarch64-unknown-linux
+            dist/earlyoom-aarch64-unknown-linux.sha256

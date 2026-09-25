@@ -7,6 +7,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	linuxproc "github.com/c9s/goprocinfo/linux"
@@ -282,20 +283,233 @@ func Test_parse_proc_pid_stat_Mock(t *testing.T) {
 	}
 }
 
-func permute_is_larger(t *testing.T, sort_by_rss bool, procs []mockProcProcess) {
-	args := poll_loop_args_t(sort_by_rss)
+// permute_is_larger checks is_larger() against every pair of `procs`, which
+// must be listed from the best victim candidate's opposite (smallest) to the
+// best victim (largest).
+func permute_is_larger(t *testing.T, args *_Ctype_poll_loop_args_t, m *_Ctype_meminfo_t, procs []mockProcProcess) {
 	for i := range procs {
 		for j := range procs {
 			// If the entry is later in the list, is_larger should return true.
 			want := j > i
-			have := is_larger(&args, procs[i], procs[j])
+			have := is_larger(args, m, procs[i], procs[j])
 			if want != have {
-				t.Errorf("j%d/pid%d larger than i%d/pid%d? want=%v have=%v", j, procs[j].pid, i, procs[i].pid, want, have)
+				t.Errorf("j%d/pid%d larger than i%d/pid%d? want=%v have=%v (badness %d vs %d)",
+					j, procs[j].pid, i, procs[i].pid, want, have,
+					badness(args, m, procs[j]), badness(args, m, procs[i]))
 			}
 		}
 	}
 }
 
+// One oom_score_adj point is worth (MemTotal + SwapTotal) / 1000 KiB. With
+// these totals that is exactly 1000 KiB.
+const testMemTotalKiB = 1000000
+
+// The adj term dominates RSS within the MemTotal/1000 exchange rate, and a
+// large enough RSS gap still wins, like the kernel's soft steer.
+func Test_is_larger_adj_beats_rss(t *testing.T) {
+	procs := []mockProcProcess{
+		// smallest
+		{pid: 100, oom_score_adj: 0, VmRSSkiB: 50000},     // 50000
+		{pid: 101, oom_score_adj: 100, VmRSSkiB: 1000},    // 101000
+		{pid: 102, oom_score_adj: 100, VmRSSkiB: 2000},    // 102000
+		{pid: 103, oom_score_adj: -500, VmRSSkiB: 999000}, // 499000
+		{pid: 104, oom_score_adj: 900, VmRSSkiB: 1000},    // 901000
+		{pid: 105, oom_score_adj: 0, VmRSSkiB: 950000},    // 950000
+		// largest
+	}
+	mockProc(t, procs)
+	defer procdir_path("/proc")
+
+	args := poll_loop_args_t(orderingKernelBadness)
+	m := meminfo_t(testMemTotalKiB, 0)
+	permute_is_larger(t, &args, &m, procs)
+
+	if have := badness(&args, &m, procs[3]); have != 499000 {
+		t.Errorf("pid 103: badness want=499000 have=%d", have)
+	}
+}
+
+// gVisor serves oom_score as a constant 0 and has no VmSwap/VmPTE lines. The
+// order must still follow oom_score_adj. This is the bug the fork fixes:
+// upstream fell back to largest RSS here.
+func Test_is_larger_gvisor_zero_oom_score(t *testing.T) {
+	procs := []mockProcProcess{
+		// smallest
+		{pid: 100, oom_score_adj: 25, VmRSSkiB: 400000, gvisor: true},  // a chat: 425000
+		{pid: 101, oom_score_adj: 500, VmRSSkiB: 100000, gvisor: true}, // a worker: 600000
+		{pid: 102, oom_score_adj: 900, VmRSSkiB: 20000, gvisor: true},  // pytest: 920000
+		{pid: 103, oom_score_adj: 1000, VmRSSkiB: 5000, gvisor: true},  // chromium: 1005000
+		// largest
+	}
+	mockProc(t, procs)
+	defer procdir_path("/proc")
+
+	args := poll_loop_args_t(orderingKernelBadness)
+	m := meminfo_t(testMemTotalKiB, 0)
+	permute_is_larger(t, &args, &m, procs)
+
+	v := find_largest_process_with(&args, &m)
+	if v.pid != 103 {
+		t.Errorf("victim want=103 have=%d", v.pid)
+	}
+	if v.oomScore != 0 {
+		t.Errorf("victim oom_score want=0 have=%d", v.oomScore)
+	}
+}
+
+// VmSwap and VmPTE count like RSS, and SwapTotal scales the adj term.
+func Test_is_larger_swap_terms(t *testing.T) {
+	procs := []mockProcProcess{
+		{pid: 100, VmRSSkiB: 15000},
+		{pid: 101, VmRSSkiB: 1000, oom_score_adj: 10},
+		{pid: 102, VmRSSkiB: 1000, VmSwapkiB: 30000},
+		{pid: 103, VmRSSkiB: 1000, VmPTEkiB: 40000},
+	}
+	mockProc(t, procs)
+	defer procdir_path("/proc")
+
+	args := poll_loop_args_t(orderingKernelBadness)
+
+	noSwap := meminfo_t(testMemTotalKiB, 0)
+	// 15000, 11000, 31000, 41000
+	permute_is_larger(t, &args, &noSwap, []mockProcProcess{procs[1], procs[0], procs[2], procs[3]})
+
+	// With as much swap as RAM, one adj point is worth 2000 KiB:
+	// 15000, 21000, 31000, 41000
+	withSwap := meminfo_t(testMemTotalKiB, testMemTotalKiB)
+	permute_is_larger(t, &args, &withSwap, procs)
+}
+
+// --prefer and --avoid are worth +-300 oom_score_adj points.
+func Test_is_larger_prefer_avoid(t *testing.T) {
+	procs := []mockProcProcess{
+		// smallest
+		{pid: 100, comm: "sshd", VmRSSkiB: 200000},                    // 200000 - 300000
+		{pid: 101, comm: "foo", VmRSSkiB: 1000},                       // 1000
+		{pid: 102, comm: "foo", VmRSSkiB: 1000, oom_score_adj: 250},   // 251000
+		{pid: 103, comm: "chrome", VmRSSkiB: 1000},                    // 301000
+		{pid: 104, comm: "foo", VmRSSkiB: 1000, oom_score_adj: 301},   // 302000
+		{pid: 105, comm: "sshd", VmRSSkiB: 1000, oom_score_adj: 1000}, // 701000
+		// largest
+	}
+	mockProc(t, procs)
+	defer procdir_path("/proc")
+
+	args := poll_loop_args_t(orderingKernelBadness)
+	setPrefer(&args, "^chrome$")
+	setAvoid(&args, "^sshd$")
+	m := meminfo_t(testMemTotalKiB, 0)
+	permute_is_larger(t, &args, &m, procs)
+
+	if have := badness(&args, &m, procs[0]); have != -100000 {
+		t.Errorf("avoided sshd: badness want=-100000 have=%d", have)
+	}
+}
+
+// A process at oom_score_adj -1000 is never picked, even when it is the only
+// candidate.
+func Test_is_larger_skips_adj_minus_1000(t *testing.T) {
+	procs := []mockProcProcess{
+		{pid: 100, VmRSSkiB: 900000, oom_score_adj: -1000},
+	}
+	mockProc(t, procs)
+	defer procdir_path("/proc")
+
+	args := poll_loop_args_t(orderingKernelBadness)
+	// Even a --prefer bonus does not make it eligible.
+	setPrefer(&args, ".")
+	m := meminfo_t(testMemTotalKiB, 0)
+	if _, eligible := candidate(&args, &m, procs[0]); eligible {
+		t.Error("pid at oom_score_adj -1000 is eligible")
+	}
+	if v := find_largest_process_with(&args, &m); v.pid > 0 {
+		t.Errorf("want no victim, have pid %d", v.pid)
+	}
+}
+
+// Inside a pid namespace, pid 2 and its children are ordinary processes.
+// Only a process without an mm (no VmRSS line) is a kernel thread, and pid 1
+// is init.
+func Test_is_larger_kernel_threads(t *testing.T) {
+	procs := []mockProcProcess{
+		{pid: 1, VmRSSkiB: 500000},
+		{pid: 2, VmRSSkiB: 5000},
+		{pid: 60, ppid: 2, VmRSSkiB: 6000},
+		{pid: 70, noMm: true, oom_score_adj: 1000},
+	}
+	mockProc(t, procs)
+	defer procdir_path("/proc")
+
+	args := poll_loop_args_t(orderingKernelBadness)
+	m := meminfo_t(testMemTotalKiB, 0)
+	for _, tc := range []struct {
+		pid      int
+		eligible bool
+	}{{1, false}, {2, true}, {60, true}, {70, false}} {
+		var proc mockProcProcess
+		for _, p := range procs {
+			if p.pid == tc.pid {
+				proc = p
+			}
+		}
+		if _, have := candidate(&args, &m, proc); have != tc.eligible {
+			t.Errorf("pid %d: eligible want=%v have=%v", tc.pid, tc.eligible, have)
+		}
+	}
+	if v := find_largest_process_with(&args, &m); v.pid != 60 {
+		t.Errorf("victim want=60 have=%d", v.pid)
+	}
+}
+
+// A zombie main thread has no mm of its own; like the kernel's
+// find_lock_task_mm(), its memory is found through a live thread.
+func Test_is_larger_zombie_main_thread(t *testing.T) {
+	procs := []mockProcProcess{
+		{pid: 100, VmRSSkiB: 5000},
+		{pid: 200, zombieLeader: true, VmRSSkiB: 800000},
+	}
+	mockProc(t, procs)
+	defer procdir_path("/proc")
+
+	args := poll_loop_args_t(orderingKernelBadness)
+	m := meminfo_t(testMemTotalKiB, 0)
+	v := find_largest_process_with(&args, &m)
+	if v.pid != 200 || v.vmRssKiB != 800000 {
+		t.Errorf("victim want=200 with 800000 KiB, have=%d with %d KiB", v.pid, v.vmRssKiB)
+	}
+}
+
+// The startup self-check picks upstream_fallback when an input of the badness
+// cannot be read.
+func Test_select_ordering(t *testing.T) {
+	self := os.Getpid()
+	tcs := []struct {
+		name string
+		self mockProcProcess
+		m    _Ctype_meminfo_t
+		want _Ctype_ordering_t
+	}{
+		{"all readable", mockProcProcess{pid: self, VmRSSkiB: 1000}, meminfo_t(testMemTotalKiB, 0), orderingKernelBadness},
+		{"gVisor status", mockProcProcess{pid: self, VmRSSkiB: 1000, gvisor: true}, meminfo_t(testMemTotalKiB, 0), orderingKernelBadness},
+		{"unreadable adj", mockProcProcess{pid: self, VmRSSkiB: 1000, noAdj: true}, meminfo_t(testMemTotalKiB, 0), orderingUpstreamFallback},
+		{"no VmRSS", mockProcProcess{pid: self, noMm: true}, meminfo_t(testMemTotalKiB, 0), orderingUpstreamFallback},
+		{"no MemTotal", mockProcProcess{pid: self, VmRSSkiB: 1000}, meminfo_t(0, 0), orderingUpstreamFallback},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			mockProc(t, []mockProcProcess{tc.self})
+			defer procdir_path("/proc")
+			m := tc.m
+			if have := select_ordering(&m); have != tc.want {
+				t.Errorf("want=%s have=%s", ordering_name(tc.want), ordering_name(have))
+			}
+		})
+	}
+}
+
+// The upstream orderings are upstream's is_larger() unchanged, so these are
+// upstream's tests.
 func Test_is_larger(t *testing.T) {
 	procs := []mockProcProcess{
 		// smallest
@@ -311,7 +525,9 @@ func Test_is_larger(t *testing.T) {
 	defer procdir_path("/proc")
 	t.Logf("procdir_path=%q", procdir_path(""))
 
-	permute_is_larger(t, false, procs)
+	args := poll_loop_args_t(orderingUpstreamFallback)
+	m := meminfo_t(testMemTotalKiB, 0)
+	permute_is_larger(t, &args, &m, procs)
 }
 
 func Test_is_larger_by_rss(t *testing.T) {
@@ -330,7 +546,109 @@ func Test_is_larger_by_rss(t *testing.T) {
 	defer procdir_path("/proc")
 	t.Logf("procdir_path=%q", procdir_path(""))
 
-	permute_is_larger(t, true, procs)
+	args := poll_loop_args_t(orderingSortByRss)
+	m := meminfo_t(testMemTotalKiB, 0)
+	permute_is_larger(t, &args, &m, procs)
+}
+
+// The -N hook gets the victim's adj, RSS and the ordering in its environment,
+// and the badness when that is what chose the victim.
+func Test_notify_ext_environment(t *testing.T) {
+	victim := victimInfo{pid: 4242, oomScoreAdj: 900, badnessKiB: 920000, vmRssKiB: 20000}
+	common := []string{
+		"EARLYOOM_PID=4242\n",
+		"EARLYOOM_NAME=pytest\n",
+		"EARLYOOM_OOM_SCORE_ADJ=900\n",
+		"EARLYOOM_VMRSS_KIB=20000\n",
+	}
+	tcs := []struct {
+		ordering _Ctype_ordering_t
+		want     []string
+		absent   []string
+	}{
+		{orderingKernelBadness, []string{"EARLYOOM_BADNESS_KIB=920000\n", "EARLYOOM_ORDERING=kernel_badness\n"}, nil},
+		{orderingUpstreamFallback, []string{"EARLYOOM_ORDERING=upstream_fallback\n"}, []string{"EARLYOOM_BADNESS_KIB="}},
+	}
+	for i, tc := range tcs {
+		if i > 0 {
+			// --dryrun runs the hook at most once per second.
+			time.Sleep(1100 * time.Millisecond)
+		}
+		t.Run(ordering_name(tc.ordering), func(t *testing.T) {
+			dir := t.TempDir()
+			out := dir + "/env"
+			script := dir + "/hook.sh"
+			writeFile(t, script, "#!/bin/sh\nenv > "+out+".tmp && mv "+out+".tmp "+out+"\n")
+			if err := os.Chmod(script, 0755); err != nil {
+				t.Fatal(err)
+			}
+
+			kill_process_dryrun_notify(tc.ordering, script, victim, "pytest")
+
+			var content []byte
+			for i := 0; i < 100; i++ {
+				var err error
+				content, err = ioutil.ReadFile(out)
+				if err == nil {
+					break
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			env := string(content)
+			for _, want := range append(common, tc.want...) {
+				if !strings.Contains(env, want) {
+					t.Errorf("hook environment lacks %q:\n%s", want, env)
+				}
+			}
+			for _, absent := range tc.absent {
+				if strings.Contains(env, absent) {
+					t.Errorf("hook environment has %q:\n%s", absent, env)
+				}
+			}
+		})
+	}
+}
+
+func Test_parse_proc_pid_status_buf(t *testing.T) {
+	tcs := []struct {
+		buf    string
+		ok     bool
+		hasRss bool
+		rss    int64
+		swap   int64
+		pte    int64
+	}{
+		{"Name:\tbash\nVmRSS:\t  8240 kB\nVmPTE:\t    64 kB\nVmSwap:\t    12 kB\n", true, true, 8240, 12, 64},
+		// gVisor: no VmSwap, no VmPTE
+		{"Name:\tbash\nVmRSS:\t8240 kB\n", true, true, 8240, 0, 0},
+		// kernel thread: no Vm* lines at all
+		{"Name:\tkthreadd\nState:\tS (sleeping)\nThreads:\t1\n", true, false, 0, 0, 0},
+		// a process named like a field must not match
+		{"Name:\tVmRSS: 99 kB\nVmRSS:\t7 kB\n", true, true, 7, 0, 0},
+		{"Name:\tbash\nVmRSS:\tgarbage\n", false, false, 0, 0, 0},
+		{"", true, false, 0, 0, 0},
+	}
+	for _, tc := range tcs {
+		ok, have := parse_proc_pid_status_buf(tc.buf)
+		if ok != tc.ok {
+			t.Errorf("%q: ok want=%v have=%v", tc.buf, tc.ok, ok)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		if bool(have.has_VmRSS) != tc.hasRss || int64(have.VmRSSkiB) != tc.rss ||
+			int64(have.VmSwapkiB) != tc.swap || int64(have.VmPTEkiB) != tc.pte {
+			t.Errorf("%q: have=%#v", tc.buf, have)
+		}
+	}
+}
+
+func Test_parse_proc_pid_status_self(t *testing.T) {
+	ok, have := parse_proc_pid_status(os.Getpid())
+	if !ok || !bool(have.has_VmRSS) || have.VmRSSkiB <= 0 {
+		t.Errorf("ok=%v have=%#v", ok, have)
+	}
 }
 
 func Benchmark_parse_meminfo(b *testing.B) {

@@ -64,11 +64,11 @@ double min(double x, double y)
 // Dry-run oom kill to make sure that
 // (1) it works (meaning /proc is accessible)
 // (2) the stack grows to maximum size before calling mlockall()
-static void startup_selftests(poll_loop_args_t* args)
+static void startup_selftests(poll_loop_args_t* args, const meminfo_t* m)
 {
     {
         debug("%s: dry-running oom kill...\n", __func__);
-        procinfo_t victim = find_largest_process(args);
+        procinfo_t victim = find_largest_process(args, m);
         kill_process(args, 0, &victim);
     }
     if (args->notify_ext) {
@@ -95,7 +95,7 @@ static void startup_selftests(poll_loop_args_t* args)
     warn("PROFILE_FIND_LARGEST_PROCESS: looping forever on find_largest_process(). Use sysprof of perf to capture profile.\n");
     long i = 0;
     while (1) {
-        find_largest_process(args);
+        find_largest_process(args, m);
         i++;
 
         const int avg_n = 1000;
@@ -325,7 +325,8 @@ int main(int argc, char* argv[])
                 "  -p                        set niceness of earlyoom to -20 and oom_score_adj to\n"
                 "                            -100\n"
                 "  --ignore-root-user        do not kill processes owned by root\n"
-                "  --sort-by-rss             find process with the largest rss (default oom_score)\n"
+                "  --sort-by-rss             find process with the largest rss (default: the\n"
+                "                            kernel's badness, from oom_score_adj and memory)\n"
                 "  --prefer REGEX            prefer to kill processes matching REGEX\n"
                 "  --avoid REGEX             avoid killing processes matching REGEX\n"
                 "  --ignore REGEX            ignore processes matching REGEX\n"
@@ -408,6 +409,12 @@ int main(int argc, char* argv[])
         }
     }
 
+    args.ordering = select_ordering(&m);
+    if (args.sort_by_rss && args.ordering == ORDERING_KERNEL_BADNESS) {
+        args.ordering = ORDERING_SORT_BY_RSS;
+    }
+    fprintf(stderr, "victim ordering: %s\n", ordering_name(args.ordering));
+
     // Print memory limits
     fprintf(stderr, "mem total: %4lld MiB, user mem total: %4lld MiB, swap total: %4lld MiB\n",
         m.MemTotalKiB / 1024, m.UserMemTotalKiB / 1024, m.SwapTotalKiB / 1024);
@@ -416,7 +423,7 @@ int main(int argc, char* argv[])
     fprintf(stderr, "        SIGKILL when mem avail <= " PRIPCT " and swap free <= " PRIPCT "\n",
         args.mem_kill_percent, args.swap_kill_percent);
 
-    startup_selftests(&args);
+    startup_selftests(&args, &m);
 
     int err = mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT);
     // kernels older than 4.4 don't support MCL_ONFAULT. Retry without it.
@@ -524,7 +531,7 @@ static void poll_loop(const poll_loop_args_t* args)
                 args->mem_term_percent, args->swap_term_percent);
         }
         if (sig) {
-            procinfo_t victim = find_largest_process(args);
+            procinfo_t victim = find_largest_process(args, &m);
             /* The run time of find_largest_process is proportional to the number
              * of processes, and takes 2.5ms on my box with a running Gnome desktop (try "make bench").
              * This is long enough that the situation may have changed in the meantime,
