@@ -202,16 +202,14 @@ func kill_process_dryrun_notify(ordering C.ordering_t, script string, victim vic
 	C.kill_process(&args, C.SIGTERM, &v)
 }
 
-func select_ordering(m *C.meminfo_t) C.ordering_t {
-	return C.select_ordering(m)
+func select_ordering(m *C.meminfo_t) (C.ordering_t, C.rss_source_t) {
+	var r C.rss_source_t
+	o := C.select_ordering(m, &r)
+	return o, r
 }
 
 func ordering_name(o C.ordering_t) string {
 	return C.GoString(C.ordering_name(o))
-}
-
-func select_rss_source() C.rss_source_t {
-	return C.select_rss_source()
 }
 
 func rss_source_name(r C.rss_source_t) string {

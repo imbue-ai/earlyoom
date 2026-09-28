@@ -422,13 +422,12 @@ int main(int argc, char* argv[])
         }
     }
 
-    args.ordering = select_ordering(&m);
+    args.ordering = select_ordering(&m, &args.rss_source);
     if (args.sort_by_rss && args.ordering == ORDERING_KERNEL_BADNESS) {
         args.ordering = ORDERING_SORT_BY_RSS;
     }
     fprintf(stderr, "victim ordering: %s\n", ordering_name(args.ordering));
     if (args.ordering == ORDERING_KERNEL_BADNESS) {
-        args.rss_source = select_rss_source();
         fprintf(stderr, "badness counts resident memory from: %s\n", rss_source_name(args.rss_source));
     }
 

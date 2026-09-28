@@ -635,53 +635,37 @@ func Test_apply_host_meminfo(t *testing.T) {
 }
 
 // The startup self-check picks upstream_fallback when an input of the badness
-// cannot be read.
+// cannot be read. Otherwise it picks where the badness reads resident memory
+// from: a Linux status has RssAnon, and VmRSS is what the kernel counts.
+// gVisor's has none, and the smaps Anonymous total is counted instead, as long
+// as earlyoom can read its own smaps.
 func Test_select_ordering(t *testing.T) {
 	self := os.Getpid()
 	tcs := []struct {
-		name string
-		self mockProcProcess
-		m    _Ctype_meminfo_t
-		want _Ctype_ordering_t
+		name          string
+		self          mockProcProcess
+		m             _Ctype_meminfo_t
+		want          _Ctype_ordering_t
+		wantRssSource _Ctype_rss_source_t
 	}{
-		{"all readable", mockProcProcess{pid: self, VmRSSkiB: 1000}, meminfo_t(testMemTotalKiB, 0), orderingKernelBadness},
-		{"gVisor status", mockProcProcess{pid: self, VmRSSkiB: 1000, gvisor: true}, meminfo_t(testMemTotalKiB, 0), orderingKernelBadness},
-		{"unreadable adj", mockProcProcess{pid: self, VmRSSkiB: 1000, noAdj: true}, meminfo_t(testMemTotalKiB, 0), orderingUpstreamFallback},
-		{"no VmRSS", mockProcProcess{pid: self, noMm: true}, meminfo_t(testMemTotalKiB, 0), orderingUpstreamFallback},
-		{"no MemTotal", mockProcProcess{pid: self, VmRSSkiB: 1000}, meminfo_t(0, 0), orderingUpstreamFallback},
+		{"Linux status", mockProcProcess{pid: self, VmRSSkiB: 1000}, meminfo_t(testMemTotalKiB, 0), orderingKernelBadness, rssSourceVmrss},
+		{"gVisor status", mockProcProcess{pid: self, VmRSSkiB: 1000, gvisor: true}, meminfo_t(testMemTotalKiB, 0), orderingKernelBadness, rssSourceSmapsAnonymous},
+		{"gVisor status, no smaps", mockProcProcess{pid: self, VmRSSkiB: 1000, gvisor: true, noSmaps: true}, meminfo_t(testMemTotalKiB, 0), orderingKernelBadness, rssSourceVmrss},
+		{"unreadable adj", mockProcProcess{pid: self, VmRSSkiB: 1000, noAdj: true}, meminfo_t(testMemTotalKiB, 0), orderingUpstreamFallback, 0},
+		{"no VmRSS", mockProcProcess{pid: self, noMm: true}, meminfo_t(testMemTotalKiB, 0), orderingUpstreamFallback, 0},
+		{"no MemTotal", mockProcProcess{pid: self, VmRSSkiB: 1000}, meminfo_t(0, 0), orderingUpstreamFallback, 0},
 	}
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
 			mockProc(t, []mockProcProcess{tc.self})
 			defer procdir_path("/proc")
 			m := tc.m
-			if have := select_ordering(&m); have != tc.want {
+			have, haveRssSource := select_ordering(&m)
+			if have != tc.want {
 				t.Errorf("want=%s have=%s", ordering_name(tc.want), ordering_name(have))
 			}
-		})
-	}
-}
-
-// A Linux status has RssAnon, and VmRSS is what the kernel counts. gVisor's
-// has none, and the smaps Anonymous total is counted instead, as long as
-// earlyoom can read its own smaps.
-func Test_select_rss_source(t *testing.T) {
-	self := os.Getpid()
-	tcs := []struct {
-		name string
-		self mockProcProcess
-		want _Ctype_rss_source_t
-	}{
-		{"Linux status", mockProcProcess{pid: self, VmRSSkiB: 1000}, rssSourceVmrss},
-		{"gVisor status", mockProcProcess{pid: self, VmRSSkiB: 1000, gvisor: true}, rssSourceSmapsAnonymous},
-		{"gVisor status, no smaps", mockProcProcess{pid: self, VmRSSkiB: 1000, gvisor: true, noSmaps: true}, rssSourceVmrss},
-	}
-	for _, tc := range tcs {
-		t.Run(tc.name, func(t *testing.T) {
-			mockProc(t, []mockProcProcess{tc.self})
-			defer procdir_path("/proc")
-			if have := select_rss_source(); have != tc.want {
-				t.Errorf("want=%s have=%s", rss_source_name(tc.want), rss_source_name(have))
+			if have == orderingKernelBadness && haveRssSource != tc.wantRssSource {
+				t.Errorf("rss source: want=%s have=%s", rss_source_name(tc.wantRssSource), rss_source_name(haveRssSource))
 			}
 		})
 	}

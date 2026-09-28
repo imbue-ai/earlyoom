@@ -387,12 +387,44 @@ const char* ordering_name(ordering_t ordering)
     return "?";
 }
 
+const char* rss_source_name(rss_source_t rss_source)
+{
+    switch (rss_source) {
+    case RSS_SOURCE_VMRSS:
+        return "vmrss";
+    case RSS_SOURCE_SMAPS_ANONYMOUS:
+        return "smaps_anonymous";
+    }
+    return "?";
+}
+
+// select_rss_source picks where the badness reads a process's resident memory
+// from, given earlyoom's own status. A Linux kernel prints RssAnon in the
+// status of every task with an mm, and there VmRSS is what oom_badness()
+// counts. gVisor prints no RssAnon, and its VmRSS counts whole mapped ranges
+// rather than touched pages, so there the smaps Anonymous total is counted
+// instead.
+static rss_source_t select_rss_source(int self, const pid_status_t* status)
+{
+    if (status->has_RssAnon) {
+        return RSS_SOURCE_VMRSS;
+    }
+    long long anon = 0;
+    if (!parse_proc_pid_smaps_anon(&anon, self)) {
+        warn("ERROR: self-check: %s/%d/status has no RssAnon line and %s/%d/smaps cannot be read, counting VmRSS\n",
+            procdir_path, self, procdir_path, self);
+        return RSS_SOURCE_VMRSS;
+    }
+    return RSS_SOURCE_SMAPS_ANONYMOUS;
+}
+
 // select_ordering is the startup self-check: it reads every input the kernel
 // badness needs, for earlyoom's own process. If any of them cannot be read,
 // the badness cannot be computed for anyone, so victims are chosen the way
-// upstream earlyoom v1.9.0 chooses them. This never exits: under a supervisor,
-// a restart loop would leave the machine with no early shedding at all.
-ordering_t select_ordering(const meminfo_t* m)
+// upstream earlyoom v1.9.0 chooses them. Otherwise it also sets `rss_source`.
+// This never exits: under a supervisor, a restart loop would leave the
+// machine with no early shedding at all.
+ordering_t select_ordering(const meminfo_t* m, rss_source_t* rss_source)
 {
     bool ok = true;
     const int self = getpid();
@@ -419,39 +451,8 @@ ordering_t select_ordering(const meminfo_t* m)
         warn("ERROR: self-check failed, falling back to upstream earlyoom's victim ordering (by %s/$pid/oom_score)\n", procdir_path);
         return ORDERING_UPSTREAM_FALLBACK;
     }
+    *rss_source = select_rss_source(self, &status);
     return ORDERING_KERNEL_BADNESS;
-}
-
-const char* rss_source_name(rss_source_t rss_source)
-{
-    switch (rss_source) {
-    case RSS_SOURCE_VMRSS:
-        return "vmrss";
-    case RSS_SOURCE_SMAPS_ANONYMOUS:
-        return "smaps_anonymous";
-    }
-    return "?";
-}
-
-// select_rss_source is the startup check for where the badness reads a
-// process's resident memory from. A Linux kernel prints RssAnon in the status
-// of every task with an mm, and there VmRSS is what oom_badness() counts.
-// gVisor prints no RssAnon, and its VmRSS counts whole mapped ranges rather
-// than touched pages, so there the smaps Anonymous total is counted instead.
-rss_source_t select_rss_source(void)
-{
-    const int self = getpid();
-    pid_status_t status = { 0 };
-    if (!parse_proc_pid_status(&status, self) || status.has_RssAnon) {
-        return RSS_SOURCE_VMRSS;
-    }
-    long long anon = 0;
-    if (!parse_proc_pid_smaps_anon(&anon, self)) {
-        warn("ERROR: self-check: %s/%d/status has no RssAnon line and %s/%d/smaps cannot be read, counting VmRSS\n",
-            procdir_path, self, procdir_path, self);
-        return RSS_SOURCE_VMRSS;
-    }
-    return RSS_SOURCE_SMAPS_ANONYMOUS;
 }
 
 // adj_kib converts oom_score_adj points into KiB of badness the way the

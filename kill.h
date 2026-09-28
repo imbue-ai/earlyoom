@@ -20,7 +20,7 @@ typedef enum {
 } ordering_t;
 
 // Where the badness reads a process's resident memory from. See
-// select_rss_source().
+// select_rss_source() in kill.c.
 typedef enum {
     // VmRSS in /proc/$pid/status, as the kernel's oom_badness() counts it
     RSS_SOURCE_VMRSS = 0,
@@ -67,9 +67,8 @@ typedef struct {
 void kill_process(const poll_loop_args_t* args, int sig, const procinfo_t* victim);
 procinfo_t find_largest_process(const poll_loop_args_t* args, const meminfo_t* m);
 bool is_larger(const poll_loop_args_t* args, const meminfo_t* m, const procinfo_t* victim, procinfo_t* cur);
-ordering_t select_ordering(const meminfo_t* m);
+ordering_t select_ordering(const meminfo_t* m, rss_source_t* rss_source);
 const char* ordering_name(ordering_t ordering);
-rss_source_t select_rss_source(void);
 const char* rss_source_name(rss_source_t rss_source);
 
 #endif
