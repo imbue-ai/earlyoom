@@ -519,10 +519,9 @@ func Test_is_larger_gvisor_task_without_mm(t *testing.T) {
 }
 
 // gVisor's VmRSS counts every page of each range it has mapped, touched or
-// not: anonymous memory in 2 MiB-aligned blocks, and a mapped file in full
-// (a claude process carries its whole 225 MB binary). Counting the smaps
-// Anonymous total instead, a process that has mapped much but holds little
-// no longer outranks one that really holds its memory.
+// not: anonymous memory in 2 MiB-aligned blocks, and a mapped file in full.
+// Counting the smaps Anonymous total instead, a process that has mapped much
+// but holds little no longer outranks one that really holds its memory.
 func Test_is_larger_gvisor_smaps_anonymous(t *testing.T) {
 	procs := []mockProcProcess{
 		// smallest by smaps Anonymous
