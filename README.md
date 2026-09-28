@@ -54,8 +54,9 @@ counts the sum of the `Anonymous:` lines in `/proc/<pid>/smaps` in place of
 `VmRSS`, and earlyoom logs `badness counts resident memory from:
 smaps_anonymous` at startup (`vmrss` otherwise). `smaps` is read only for a
 process whose `VmRSS` could still beat the current victim. This is still
-approximate: anonymous memory is counted in 2 MiB-aligned blocks (about a
-fifth too much, summed over a live workspace), and file pages and shared
+approximate: anonymous memory is counted in 2 MiB-aligned blocks (summed
+over a live workspace, about a fifth of what was counted had never been
+touched), and file pages and shared
 memory (memfd, `/dev/shm`) are not counted at all, even a large file that
 only the victim maps.
 
