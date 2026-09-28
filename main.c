@@ -427,6 +427,10 @@ int main(int argc, char* argv[])
         args.ordering = ORDERING_SORT_BY_RSS;
     }
     fprintf(stderr, "victim ordering: %s\n", ordering_name(args.ordering));
+    if (args.ordering == ORDERING_KERNEL_BADNESS) {
+        args.rss_source = select_rss_source();
+        fprintf(stderr, "badness counts resident memory from: %s\n", rss_source_name(args.rss_source));
+    }
 
     // Print memory limits
     fprintf(stderr, "mem total: %4lld MiB, user mem total: %4lld MiB, swap total: %4lld MiB\n",

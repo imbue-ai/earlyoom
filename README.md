@@ -41,10 +41,26 @@ computed the way `oom_badness()` in `mm/oom_kill.c` does, in KiB:
 
 The memory counters come from `/proc/<pid>/status` (a missing `VmSwap` or
 `VmPTE` counts as 0, which is what gVisor serves) and the totals from
-`/proc/meminfo`. This applies everywhere, with no gVisor detection; on a Linux
-kernel it reproduces the kernel's own `oom_score` ordering. `--prefer` and
-`--avoid` are worth +300 and -300 points of `oom_score_adj`, the weight they
-had against `oom_score`. Processes at `oom_score_adj` -1000 are never picked.
+`/proc/meminfo`. On a Linux kernel this reproduces the kernel's own
+`oom_score` ordering.
+
+Under gVisor, `VmRSS` counts every page of each range gVisor has mapped for
+the process, not the pages it touched: anonymous memory in 2 MiB-aligned
+blocks, and a mapped file in full on its first read. Each claude process
+carries the whole 225 MB claude binary in its `VmRSS`, and killing one frees
+none of it while another still runs. So where `/proc/self/status` has no
+`RssAnon` line (Linux always prints one, gVisor never does), the badness
+counts the sum of the `Anonymous:` lines in `/proc/<pid>/smaps` in place of
+`VmRSS`, and earlyoom logs `badness counts resident memory from:
+smaps_anonymous` at startup (`vmrss` otherwise). `smaps` is read only for a
+process whose `VmRSS` could still beat the current victim. This is still
+approximate: anonymous memory is counted in 2 MiB-aligned blocks (about a
+fifth too much, summed over a live workspace), and file pages and shared
+memory (memfd, `/dev/shm`) are not counted at all, even a large file that
+only the victim maps.
+
+`--prefer` and `--avoid` are worth +300 and -300 points of `oom_score_adj`,
+the weight they had against `oom_score`. Processes at `oom_score_adj` -1000 are never picked.
 A process without an mm is never picked: killing it frees nothing. On Linux
 that is a kernel thread, a zombie or an exiting process, recognised by having
 no `VmRSS` line, not by pid (inside a pid namespace, pid 2 and its children are
@@ -66,11 +82,16 @@ is never picked, and, as upstream, earlyoom never kills itself.
 * `sort_by_rss`: `--sort-by-rss` was passed; upstream's `--sort-by-rss`
   selection, unchanged.
 
+**`process_mrelease`.** gVisor does not implement it. earlyoom logs that
+once, on the first kill, and stops calling it; the victim's memory is then
+released when it exits.
+
 **`-N` hook.** Besides `EARLYOOM_PID`, `EARLYOOM_UID`, `EARLYOOM_NAME` and
 `EARLYOOM_CMDLINE`, the hook gets `EARLYOOM_OOM_SCORE_ADJ`,
 `EARLYOOM_VMRSS_KIB` and `EARLYOOM_ORDERING` (the mode above), plus
 `EARLYOOM_BADNESS_KIB` under `kernel_badness`. Under `kernel_badness` the kill
-log line also carries the badness and the ordering; otherwise it is upstream's.
+log line also carries the badness, the resident memory it counted and where
+from, and the ordering; otherwise it is upstream's.
 
 **`--host-meminfo /PATH`.** A sandbox's own `/proc/meminfo` can overstate its
 headroom. Under gVisor it cannot see the memory the runtime itself is charged
@@ -94,8 +115,9 @@ starts and stops being the case. The victim's badness still uses the sandbox's
 **Releases.** A `v*` tag publishes static binaries for
 `earlyoom-x86_64-unknown-linux` and `earlyoom-aarch64-unknown-linux`, each with
 a `.sha256`. CI also runs the binary under gVisor (`runsc`) with a memory limit
-and checks that the kill order follows the badness and that a zombie is never
-signalled.
+and checks that the kill order follows the badness, that a zombie is never
+signalled, that a shared file mapping does not count, and that the missing
+`process_mrelease` is logged at most once.
 
 What does it do
 ---------------

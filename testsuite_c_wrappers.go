@@ -65,6 +65,11 @@ const (
 	orderingSortByRss        = C.ORDERING_SORT_BY_RSS
 )
 
+const (
+	rssSourceVmrss          = C.RSS_SOURCE_VMRSS
+	rssSourceSmapsAnonymous = C.RSS_SOURCE_SMAPS_ANONYMOUS
+)
+
 // Wrapper so _test.go code can create a poll_loop_args_t
 // struct. _test.go code cannot use C.
 func poll_loop_args_t(ordering C.ordering_t) (args C.poll_loop_args_t) {
@@ -75,6 +80,14 @@ func poll_loop_args_t(ordering C.ordering_t) (args C.poll_loop_args_t) {
 
 // compileRegex returns a regex_t for --prefer/--avoid/--ignore. It is never
 // freed; the tests are short-lived.
+// badness_poll_loop_args_t is poll_loop_args_t(ORDERING_KERNEL_BADNESS),
+// reading resident memory from `rssSource`.
+func badness_poll_loop_args_t(rssSource C.rss_source_t) (args C.poll_loop_args_t) {
+	args = poll_loop_args_t(C.ORDERING_KERNEL_BADNESS)
+	args.rss_source = rssSource
+	return
+}
+
 func compileRegex(pattern string) *C.regex_t {
 	re := (*C.regex_t)(C.malloc(C.size_t(unsafe.Sizeof(C.regex_t{}))))
 	cpattern := C.CString(pattern)
@@ -195,6 +208,22 @@ func select_ordering(m *C.meminfo_t) C.ordering_t {
 
 func ordering_name(o C.ordering_t) string {
 	return C.GoString(C.ordering_name(o))
+}
+
+func select_rss_source() C.rss_source_t {
+	return C.select_rss_source()
+}
+
+func rss_source_name(r C.rss_source_t) string {
+	return C.GoString(C.rss_source_name(r))
+}
+
+func parse_proc_pid_smaps_anon_path(path string) (ok bool, anonKiB int64) {
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+	var out C.longlong
+	ok = bool(C.parse_proc_pid_smaps_anon_path(&out, cpath))
+	return ok, int64(out)
 }
 
 func get_oom_score(pid int) int {

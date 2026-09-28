@@ -182,6 +182,11 @@ type mockProcProcess struct {
 	gvisorNoMm bool
 	// noAdj omits oom_score_adj.
 	noAdj bool
+	// smapsAnonKiB is the Anonymous total in smaps. gVisor's VmRSS counts
+	// whole mapped ranges, so it can be far above this. Zero means VmRSSkiB.
+	smapsAnonKiB int
+	// noSmaps omits smaps.
+	noSmaps bool
 }
 
 func (m *mockProcProcess) toProcinfo_t() (p C.procinfo_t) {
@@ -209,6 +214,24 @@ func (m *mockProcProcess) statusContent(omitVm bool) string {
 	}
 	s += fmt.Sprintf("Threads:\t%d\n", m.num_threads)
 	return s
+}
+
+// smapsContent renders /proc/$pid/smaps: a file mapping that holds the part
+// of VmRSS that is not anonymous, and the anonymous memory split between the
+// heap and an anonymous mapping. Only the lines around Anonymous are included.
+func (m *mockProcProcess) smapsContent() string {
+	anon := m.smapsAnonKiB
+	if anon == 0 {
+		anon = m.VmRSSkiB
+	}
+	vma := func(header string, rss, anon int) string {
+		return fmt.Sprintf("%s\nSize:\t%d kB\nRss:\t%d kB\nPss:\t%d kB\nAnonymous:\t%d kB\nAnonHugePages:\t0 kB\nSwap:\t0 kB\n",
+			header, rss, rss, rss, anon)
+	}
+	heap := anon / 2
+	return vma("55d5c0a00000-55d5c0c00000 r-xp 00000000 00:31 1234 /usr/bin/"+m.comm, m.VmRSSkiB-anon, 0) +
+		vma("55d5c1000000-55d5d1000000 rw-p 00000000 00:00 0 [heap]", heap, heap) +
+		vma("7f3a00000000-7f3a40000000 rw-p 00000000 00:00 0", anon-heap, anon-heap)
 }
 
 func writeFile(t testing.TB, path string, content string) {
@@ -271,6 +294,9 @@ func mockProc(t testing.TB, procs []mockProcProcess) {
 			live := p
 			live.state = "S"
 			writeFile(t, taskDir+"/status", live.statusContent(false))
+		}
+		if !p.noSmaps && !p.noMm && !p.gvisorNoMm {
+			writeFile(t, pidDir+"/smaps", p.smapsContent())
 		}
 		// oom_score
 		writeFile(t, pidDir+"/oom_score", fmt.Sprintf("%d\n", p.oom_score))

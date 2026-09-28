@@ -57,6 +57,9 @@ typedef struct procinfo {
     long long VmPTEkiB;
     // The kernel's oom_badness() in KiB, see is_larger()
     long long badness_kib;
+    // The resident memory the badness counts, in KiB: VmRSSkiB, or the
+    // smaps Anonymous total (see rss_source_t)
+    long long badness_rss_kib;
     pid_stat_t stat;
     char name[PATH_LEN];
     char cmdline[PATH_LEN];

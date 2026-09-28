@@ -82,7 +82,9 @@ jobs:
   # order must follow the kernel badness, where the band's oom_score_adj beats
   # a larger RSS. gVisor serves every oom_score as 0, so this is the case
   # upstream earlyoom gets wrong; the control step checks that it still does,
-  # which proves the test can fail.
+  # which proves the test can fail. The other controls check that the
+  # previous release still signals a zombie and still counts a shared file
+  # mapping's whole VmRSS.
   runsc-ordering:
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
@@ -122,16 +124,21 @@ jobs:
         cp /tmp/imbue2/earlyoom earlyoom-imbue2
     - name: Kill order follows the badness under runsc
       run: >-
-        docker run --rm --runtime=runsc --memory=512m --memory-swap=512m --cap-add SYS_RESOURCE
+        docker run --rm --runtime=runsc --memory=768m --memory-swap=768m --cap-add SYS_RESOURCE
         -v "$PWD:/work:ro" python:3.12-slim
         python3 /work/ci/runsc_ordering_test.py --earlyoom /work/earlyoom-fork --expect badness
     - name: "Control: upstream v1.9.0 kills out of badness order under runsc"
       run: >-
-        docker run --rm --runtime=runsc --memory=512m --memory-swap=512m --cap-add SYS_RESOURCE
+        docker run --rm --runtime=runsc --memory=768m --memory-swap=768m --cap-add SYS_RESOURCE
         -v "$PWD:/work:ro" python:3.12-slim
         python3 /work/ci/runsc_ordering_test.py --earlyoom /work/earlyoom-upstream --expect not-badness
     - name: "Control: v1.9.0-imbue.2 signals a zombie under runsc"
       run: >-
-        docker run --rm --runtime=runsc --memory=512m --memory-swap=512m --cap-add SYS_RESOURCE
+        docker run --rm --runtime=runsc --memory=768m --memory-swap=768m --cap-add SYS_RESOURCE
         -v "$PWD:/work:ro" python:3.12-slim
         python3 /work/ci/runsc_ordering_test.py --earlyoom /work/earlyoom-imbue2 --expect zombie-signalled
+    - name: "Control: v1.9.0-imbue.2 counts a shared file mapping's whole VmRSS under runsc"
+      run: >-
+        docker run --rm --runtime=runsc --memory=768m --memory-swap=768m --cap-add SYS_RESOURCE
+        -v "$PWD:/work:ro" python:3.12-slim
+        python3 /work/ci/runsc_ordering_test.py --earlyoom /work/earlyoom-imbue2 --expect vmrss-order --no-zombie

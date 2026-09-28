@@ -265,8 +265,17 @@ int kill_release(const pid_t pid, const int pidfd, const int sig)
         return 0;
     }
 
+    // gVisor does not implement process_mrelease: say so once, then stop
+    // calling it.
+    static bool mrelease_unsupported = false;
+    if (mrelease_unsupported) {
+        return 0;
+    }
     res = process_mrelease(pidfd, 0);
-    if (res != 0) {
+    if (res != 0 && errno == ENOSYS) {
+        warn("%s: process_mrelease is not implemented here, not calling it again\n", __func__);
+        mrelease_unsupported = true;
+    } else if (res != 0) {
         warn("%s: pid=%d: process_mrelease pidfd=%d failed: %s\n", __func__, pid, pidfd, strerror(errno));
     } else {
         info("%s: pid=%d: process_mrelease pidfd=%d success\n", __func__, pid, pidfd);
@@ -413,6 +422,38 @@ ordering_t select_ordering(const meminfo_t* m)
     return ORDERING_KERNEL_BADNESS;
 }
 
+const char* rss_source_name(rss_source_t rss_source)
+{
+    switch (rss_source) {
+    case RSS_SOURCE_VMRSS:
+        return "vmrss";
+    case RSS_SOURCE_SMAPS_ANONYMOUS:
+        return "smaps_anonymous";
+    }
+    return "?";
+}
+
+// select_rss_source is the startup check for where the badness reads a
+// process's resident memory from. A Linux kernel prints RssAnon in the status
+// of every task with an mm, and there VmRSS is what oom_badness() counts.
+// gVisor prints no RssAnon, and its VmRSS counts whole mapped ranges rather
+// than touched pages, so there the smaps Anonymous total is counted instead.
+rss_source_t select_rss_source(void)
+{
+    const int self = getpid();
+    pid_status_t status = { 0 };
+    if (!parse_proc_pid_status(&status, self) || status.has_RssAnon) {
+        return RSS_SOURCE_VMRSS;
+    }
+    long long anon = 0;
+    if (!parse_proc_pid_smaps_anon(&anon, self)) {
+        warn("ERROR: self-check: %s/%d/status has no RssAnon line and %s/%d/smaps cannot be read, counting VmRSS\n",
+            procdir_path, self, procdir_path, self);
+        return RSS_SOURCE_VMRSS;
+    }
+    return RSS_SOURCE_SMAPS_ANONYMOUS;
+}
+
 // adj_kib converts oom_score_adj points into KiB of badness the way the
 // kernel's oom_badness() does: one point is worth 1/1000 of RAM plus swap.
 static long long adj_kib(const meminfo_t* m, long long adj)
@@ -476,7 +517,8 @@ static bool read_mm_status(int pid, pid_status_t* out)
 // It is computed here instead of read from /proc/$pid/oom_score because
 // gVisor serves oom_score as a constant 0, which would reduce the choice to
 // largest RSS and ignore oom_score_adj. On a Linux kernel it reproduces the
-// kernel's own ordering.
+// kernel's own ordering. Under RSS_SOURCE_SMAPS_ANONYMOUS (gVisor), the smaps
+// Anonymous total stands in for VmRSS.
 static bool is_larger_badness(const poll_loop_args_t* args, const meminfo_t* m, const procinfo_t* victim, procinfo_t* cur)
 {
     if (cur->pid == 1) {
@@ -540,13 +582,28 @@ static bool is_larger_badness(const poll_loop_args_t* args, const meminfo_t* m, 
             return false;
         }
     }
-    cur->badness_kib = cur->VmRSSkiB + cur->VmSwapkiB + cur->VmPTEkiB + adj_kib(m, adj);
+    const long long adj_term = adj_kib(m, adj);
+    long long rss = cur->VmRSSkiB;
+    // The anonymous memory is part of VmRSS, so a process with no VmRSS has
+    // none, and one that cannot win even with all of its VmRSS counted needs
+    // no smaps read.
+    if (args->rss_source == RSS_SOURCE_SMAPS_ANONYMOUS && rss > 0) {
+        if (rss + cur->VmSwapkiB + cur->VmPTEkiB + adj_term < victim->badness_kib) {
+            return false;
+        }
+        if (!parse_proc_pid_smaps_anon(&rss, cur->pid)) {
+            debug("%s: pid %d: error reading smaps\n", __func__, cur->pid);
+            return false;
+        }
+    }
+    cur->badness_rss_kib = rss;
+    cur->badness_kib = rss + cur->VmSwapkiB + cur->VmPTEkiB + adj_term;
 
     if (cur->badness_kib < victim->badness_kib) {
         return false;
     }
     // Tie-break on RSS.
-    if (cur->badness_kib == victim->badness_kib && cur->VmRSSkiB <= victim->VmRSSkiB) {
+    if (cur->badness_kib == victim->badness_kib && cur->badness_rss_kib <= victim->badness_rss_kib) {
         return false;
     }
     return true;
@@ -852,9 +909,10 @@ void kill_process(const poll_loop_args_t* args, int sig, const procinfo_t* victi
     // sig == 0 is used as a self-test during startup. Don't notify the user.
     if (sig != 0 || enable_debug) {
         if (args->ordering == ORDERING_KERNEL_BADNESS) {
-            warn("sending %s to process %d uid %d \"%s\": oom_score %d, oom_score_adj %d, badness %lld KiB, VmRSS %lld MiB, ordering %s, cmdline \"%s\"\n",
+            warn("sending %s to process %d uid %d \"%s\": oom_score %d, oom_score_adj %d, badness %lld KiB, VmRSS %lld MiB, counted RSS %lld MiB (%s), ordering %s, cmdline \"%s\"\n",
                 sig_name, victim->pid, victim->uid, victim->name, victim->oom_score, victim->oom_score_adj, victim->badness_kib,
-                victim->VmRSSkiB / 1024, ordering_name(args->ordering), victim->cmdline);
+                victim->VmRSSkiB / 1024, victim->badness_rss_kib / 1024, rss_source_name(args->rss_source),
+                ordering_name(args->ordering), victim->cmdline);
         } else {
             if (sig != 0 && args->ordering == ORDERING_UPSTREAM_FALLBACK) {
                 warn("ERROR: victim chosen by upstream earlyoom's ordering (upstream_fallback): the startup self-check could not read the badness inputs\n");

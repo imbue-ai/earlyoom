@@ -19,6 +19,17 @@ typedef enum {
     ORDERING_SORT_BY_RSS,
 } ordering_t;
 
+// Where the badness reads a process's resident memory from. See
+// select_rss_source().
+typedef enum {
+    // VmRSS in /proc/$pid/status, as the kernel's oom_badness() counts it
+    RSS_SOURCE_VMRSS = 0,
+    // The Anonymous lines of /proc/$pid/smaps. gVisor's VmRSS counts every
+    // page of each range it has mapped, not the pages that were touched:
+    // anonymous memory in 2 MiB-aligned blocks and a mapped file in full.
+    RSS_SOURCE_SMAPS_ANONYMOUS,
+} rss_source_t;
+
 typedef struct {
     /* if the available memory AND swap goes below these percentages,
      * we start killing processes */
@@ -49,6 +60,8 @@ typedef struct {
     bool dryrun;
     /* how the victim is chosen */
     ordering_t ordering;
+    /* where ORDERING_KERNEL_BADNESS reads resident memory from */
+    rss_source_t rss_source;
 } poll_loop_args_t;
 
 void kill_process(const poll_loop_args_t* args, int sig, const procinfo_t* victim);
@@ -56,5 +69,7 @@ procinfo_t find_largest_process(const poll_loop_args_t* args, const meminfo_t* m
 bool is_larger(const poll_loop_args_t* args, const meminfo_t* m, const procinfo_t* victim, procinfo_t* cur);
 ordering_t select_ordering(const meminfo_t* m);
 const char* ordering_name(ordering_t ordering);
+rss_source_t select_rss_source(void);
+const char* rss_source_name(rss_source_t rss_source);
 
 #endif

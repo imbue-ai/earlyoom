@@ -18,6 +18,8 @@ typedef struct {
 // VmSize of 0 means the same thing there (see status_has_mm()).
 typedef struct {
     bool has_VmRSS;
+    // Linux prints RssAnon (4.5+) for a task with an mm; gVisor never does.
+    bool has_RssAnon;
     long long VmRSSkiB;
     long long VmSwapkiB;
     long long VmPTEkiB;
@@ -34,5 +36,7 @@ bool parse_proc_pid_stat(pid_stat_t* out, int pid);
 bool parse_proc_pid_status_buf(pid_status_t* out, const char* buf);
 bool parse_proc_pid_status(pid_status_t* out, int pid);
 bool parse_proc_pid_status_path(pid_status_t* out, const char* path);
+bool parse_proc_pid_smaps_anon_path(long long* out, const char* path);
+bool parse_proc_pid_smaps_anon(long long* out, int pid);
 
 #endif
