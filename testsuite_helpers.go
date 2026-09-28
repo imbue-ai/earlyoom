@@ -176,6 +176,10 @@ type mockProcProcess struct {
 	zombieLeader bool
 	// gvisor writes status the way gVisor does: no VmSwap or VmPTE lines.
 	gvisor bool
+	// gvisorNoMm writes status the way gVisor does for a task that has lost
+	// its mm (a zombie, or a task still exiting): every Vm* line reads 0. No
+	// task directory is written, as gVisor cannot list a zombie leader's.
+	gvisorNoMm bool
 	// noAdj omits oom_score_adj.
 	noAdj bool
 }
@@ -194,7 +198,9 @@ func (m *mockProcProcess) toProcinfo_t() (p C.procinfo_t) {
 // earlyoom reads are included.
 func (m *mockProcProcess) statusContent(omitVm bool) string {
 	s := fmt.Sprintf("Name:\t%s\nState:\t%s\nPid:\t%d\nPPid:\t%d\n", m.comm, m.state, m.pid, m.ppid)
-	if !omitVm {
+	if m.gvisorNoMm {
+		s += "VmSize:\t0 kB\nVmRSS:\t0 kB\nVmData:\t0 kB\n"
+	} else if !omitVm {
 		s += fmt.Sprintf("VmPeak:\t%d kB\nVmSize:\t%d kB\nVmHWM:\t%d kB\nVmRSS:\t%d kB\n",
 			m.VmRSSkiB*2, m.VmRSSkiB*2, m.VmRSSkiB, m.VmRSSkiB)
 		if !m.gvisor {
@@ -242,7 +248,7 @@ func mockProc(t testing.TB, procs []mockProcProcess) {
 		// rss = 2nd field, in pages. The other fields are not used by earlyoom.
 		rss := p.VmRSSkiB * 1024 / os.Getpagesize()
 		statRss := rss
-		if p.noMm || p.zombieLeader {
+		if p.noMm || p.zombieLeader || p.gvisorNoMm {
 			statRss = 0
 		}
 		writeFile(t, pidDir+"/statm", fmt.Sprintf("1 %d 3 4 5 6 7\n", statRss))

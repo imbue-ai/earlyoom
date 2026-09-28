@@ -246,6 +246,41 @@ func parse_proc_pid_status_buf(buf string) (res bool, out C.pid_status_t) {
 	return res, out
 }
 
+func status_has_mm(buf string) bool {
+	ok, status := parse_proc_pid_status_buf(buf)
+	return ok && bool(C.status_has_mm(&status))
+}
+
+// sandboxMeminfo is a meminfo_t as parse_meminfo() fills it from a sandbox's
+// own /proc/meminfo.
+func sandboxMeminfo(memTotalKiB, availKiB, userTotalKiB int64) (m C.meminfo_t) {
+	m.MemTotalKiB = C.longlong(memTotalKiB)
+	m.MemAvailableKiB = C.longlong(availKiB)
+	m.UserMemTotalKiB = C.longlong(userTotalKiB)
+	m.MemAvailablePercent = C.double(float64(availKiB) * 100 / float64(userTotalKiB))
+	return
+}
+
+type hostMeminfoResult = C.host_meminfo_result_t
+
+const (
+	hostMeminfoApplied   = C.HOST_MEMINFO_APPLIED
+	hostMeminfoNotLower  = C.HOST_MEMINFO_NOT_LOWER
+	hostMeminfoInvalid   = C.HOST_MEMINFO_INVALID
+	hostMeminfoStale     = C.HOST_MEMINFO_STALE
+	hostMeminfoMaxAgeSec = C.HOST_MEMINFO_MAX_AGE_S
+)
+
+func apply_host_meminfo(m *C.meminfo_t, buf string, nowSec int64) hostMeminfoResult {
+	cbuf := C.CString(buf)
+	defer C.free(unsafe.Pointer(cbuf))
+	return C.apply_host_meminfo(m, cbuf, C.longlong(nowSec))
+}
+
+func host_meminfo_result_name(res hostMeminfoResult) string {
+	return C.GoString(C.host_meminfo_result_name(res))
+}
+
 func parse_proc_pid_status(pid int) (res bool, out C.pid_status_t) {
 	res = bool(C.parse_proc_pid_status(&out, C.int(pid)))
 	return res, out

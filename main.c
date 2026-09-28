@@ -43,6 +43,7 @@ enum {
     LONG_OPT_IGNORE_ROOT,
     LONG_OPT_USE_SYSLOG,
     LONG_OPT_SORT_BY_RSS,
+    LONG_OPT_HOST_MEMINFO,
 };
 
 static int set_oom_score_adj(int);
@@ -185,6 +186,7 @@ int main(int argc, char* argv[])
         { "ignore-root-user", no_argument, NULL, LONG_OPT_IGNORE_ROOT },
         { "sort-by-rss", no_argument, NULL, LONG_OPT_SORT_BY_RSS },
         { "syslog", no_argument, NULL, LONG_OPT_USE_SYSLOG },
+        { "host-meminfo", required_argument, NULL, LONG_OPT_HOST_MEMINFO },
         { "help", no_argument, NULL, 'h' },
         { "debug", no_argument, NULL, 'd' },
         { 0, 0, NULL, 0 } /* end-of-array marker */
@@ -301,6 +303,14 @@ int main(int argc, char* argv[])
         case LONG_OPT_IGNORE:
             ignore_cmds = optarg;
             break;
+        case LONG_OPT_HOST_MEMINFO:
+            // earlyoom runs with /proc as its working directory.
+            if (optarg[0] != '/') {
+                fatal(13, "--host-meminfo: '%s' is not an absolute path\n", optarg);
+            }
+            host_meminfo_path = optarg;
+            fprintf(stderr, "Also reading memory headroom from %s\n", host_meminfo_path);
+            break;
         case 'h':
             fprintf(stderr,
                 "Usage: %s [OPTION]...\n"
@@ -332,6 +342,9 @@ int main(int argc, char* argv[])
                 "  --ignore REGEX            ignore processes matching REGEX\n"
                 "  --dryrun                  dry run (do not kill any processes)\n"
                 "  --syslog                  use syslog instead of std streams\n"
+                "  --host-meminfo /PATH      also read MemTotal, MemAvailable and Timestamp\n"
+                "                            from this file, written from outside a sandbox,\n"
+                "                            and act on it when it reports less headroom\n"
                 "  -h, --help                this help text\n",
                 argv[0]);
             exit(0);
@@ -521,6 +534,9 @@ static void poll_loop(const poll_loop_args_t* args)
     while (1) {
         meminfo_t m = parse_meminfo();
         int sig = lowmem_sig(args, &m);
+        if (sig && m.host_limited) {
+            warn("mem avail below is from host meminfo %s\n", host_meminfo_path);
+        }
         if (sig == SIGKILL) {
             print_mem_stats(warn, m);
             warn("low memory! at or below SIGKILL limits: mem " PRIPCT ", swap " PRIPCT "\n",

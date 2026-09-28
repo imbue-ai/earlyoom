@@ -9,11 +9,20 @@ the smallest oom_score_adj: ordering by RSS alone (what upstream earlyoom does
 under gVisor, where every oom_score reads 0) kills them in the opposite order
 from the kernel's badness.
 
+It also leaves a zombie at oom_score_adj 1000: a child that exits and is never
+waited for. gVisor prints its Vm* lines as 0 rather than omitting them, so an
+earlyoom that takes a VmRSS line to mean a live mm scores the zombie on its
+adj alone, above every sleeper, and signals it over and over while nothing is
+freed.
+
 Exit status 0 means the kill order matched --expect:
 
-  badness  every sleeper was killed, in descending badness order
+  badness  every sleeper was killed, in descending badness order, and the
+           zombie was never signalled
   not-badness  the first sleeper killed was not the one with the highest
            badness (the control run against upstream earlyoom)
+  zombie-signalled  earlyoom signalled the zombie (the control run against
+           v1.9.0-imbue.2, the release before the fix)
 """
 
 import argparse
@@ -65,6 +74,14 @@ def rss_kib(pid: int) -> int:
     return 0
 
 
+def hook_pids() -> list[int]:
+    """The pids earlyoom has signalled so far, one entry per signal."""
+    if not os.path.exists(HOOK_LOG):
+        return []
+    with open(HOOK_LOG) as f:
+        return [int(line.split()[0]) for line in f if line.split()]
+
+
 def badness_kib(adj: int, rss: int, total_kib: int) -> int:
     return rss + adj * total_kib // 1000
 
@@ -72,7 +89,7 @@ def badness_kib(adj: int, rss: int, total_kib: int) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--earlyoom", required=True)
-    parser.add_argument("--expect", choices=("badness", "not-badness"), required=True)
+    parser.add_argument("--expect", choices=("badness", "not-badness", "zombie-signalled"), required=True)
     parser.add_argument("--timeout", type=float, default=240)
     args = parser.parse_args()
 
@@ -85,6 +102,14 @@ def main() -> int:
             f'echo "$EARLYOOM_PID ${{EARLYOOM_OOM_SCORE_ADJ:-}} ${{EARLYOOM_BADNESS_KIB:-}} ${{EARLYOOM_ORDERING:-}}" >> {HOOK_LOG}\n'
         )
     os.chmod(HOOK_PATH, 0o755)
+
+    # Forked before earlyoom starts and never waited for, so it stays a zombie
+    # for the whole run.
+    zombie_pid = os.fork()
+    if zombie_pid == 0:
+        set_own_adj(1000)
+        os._exit(0)
+    print(f"zombie pid {zombie_pid}", flush=True)
 
     total_kib = meminfo_kib("MemTotal") + meminfo_kib("SwapTotal")
     print(f"MemTotal+SwapTotal: {total_kib // 1024} MiB", flush=True)
@@ -130,12 +155,14 @@ def main() -> int:
     )
     hog = subprocess.Popen([sys.executable, "-c", hog_code])
 
-    # The control only needs the first kill.
+    # The controls only need the first kill, or the first signal to the zombie.
     wanted = len(sleepers) if args.expect == "badness" else 1
     killed = []
     deadline = time.monotonic() + args.timeout
     try:
         while len(killed) < wanted and time.monotonic() < deadline and hog.poll() is None:
+            if args.expect == "zombie-signalled" and zombie_pid in hook_pids():
+                break
             for pid, (proc, adj) in sleepers.items():
                 if proc.poll() is not None and pid not in {k for k, _ in killed}:
                     killed.append((pid, adj))
@@ -155,8 +182,23 @@ def main() -> int:
 
     predicted_adjs = [adj for _, _, adj in predicted]
     killed_adjs = [adj for _, adj in killed]
-    verdict = {"expect": args.expect, "predicted_adjs": predicted_adjs, "killed_adjs": killed_adjs}
+    zombie_signals = hook_pids().count(zombie_pid)
+    verdict = {
+        "expect": args.expect,
+        "predicted_adjs": predicted_adjs,
+        "killed_adjs": killed_adjs,
+        "zombie_signals": zombie_signals,
+    }
     print(json.dumps(verdict), flush=True)
+
+    if args.expect == "zombie-signalled":
+        if zombie_signals == 0:
+            print("FAIL: the control never signalled the zombie", flush=True)
+            return 1
+        return 0
+    if zombie_signals:
+        print(f"FAIL: earlyoom signalled the zombie {zombie_signals} time(s)", flush=True)
+        return 1
 
     if args.expect == "badness":
         if killed_adjs != predicted_adjs:

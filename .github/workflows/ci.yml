@@ -109,7 +109,7 @@ jobs:
         sudo /usr/local/bin/runsc install
         sudo systemctl restart docker
         docker run --rm --runtime=runsc busybox dmesg | grep 'Starting gVisor'
-    - name: Build the fork and upstream v1.9.0 (static)
+    - name: Build the fork, upstream v1.9.0 and v1.9.0-imbue.2 (static)
       run: |
         set -euxo pipefail
         CFLAGS=-static make earlyoom
@@ -117,6 +117,9 @@ jobs:
         git worktree add /tmp/upstream v1.9.0
         (cd /tmp/upstream && CFLAGS=-static make earlyoom)
         cp /tmp/upstream/earlyoom earlyoom-upstream
+        git worktree add /tmp/imbue2 v1.9.0-imbue.2
+        (cd /tmp/imbue2 && CFLAGS=-static make earlyoom)
+        cp /tmp/imbue2/earlyoom earlyoom-imbue2
     - name: Kill order follows the badness under runsc
       run: >-
         docker run --rm --runtime=runsc --memory=512m --memory-swap=512m --cap-add SYS_RESOURCE
@@ -127,3 +130,8 @@ jobs:
         docker run --rm --runtime=runsc --memory=512m --memory-swap=512m --cap-add SYS_RESOURCE
         -v "$PWD:/work:ro" python:3.12-slim
         python3 /work/ci/runsc_ordering_test.py --earlyoom /work/earlyoom-upstream --expect not-badness
+    - name: "Control: v1.9.0-imbue.2 signals a zombie under runsc"
+      run: >-
+        docker run --rm --runtime=runsc --memory=512m --memory-swap=512m --cap-add SYS_RESOURCE
+        -v "$PWD:/work:ro" python:3.12-slim
+        python3 /work/ci/runsc_ordering_test.py --earlyoom /work/earlyoom-imbue2 --expect zombie-signalled

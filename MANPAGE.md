@@ -216,6 +216,13 @@ systems that don't run systemd.
 See https://github.com/rfjakob/earlyoom/pull/292 for some
 background info.
 
+#### \-\-host-meminfo /PATH
+also read MemTotal, MemAvailable and Timestamp (unix seconds) from this file,
+in /proc/meminfo's format, and act on it whenever it reports less available
+memory than /proc/meminfo. Meant for a file written from outside a sandbox
+whose own /proc/meminfo cannot see all the memory charged to its limit. A file
+that is missing, malformed or more than 5 seconds old is ignored.
+
 #### -h, \-\-help
 this help text
 

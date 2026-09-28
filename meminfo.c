@@ -10,12 +10,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "globals.h"
 #include "meminfo.h"
 #include "msg.h"
 #include "proc_pid.h"
+
+static void apply_host_meminfo_file(meminfo_t* m);
 
 /* Parse the contents of /proc/meminfo (in buf), return value of "name"
  * (example: "MemTotal:")
@@ -119,7 +122,90 @@ meminfo_t parse_meminfo()
         m.SwapFreePercent = 0;
     }
 
+    if (host_meminfo_path != NULL) {
+        apply_host_meminfo_file(&m);
+    }
     return m;
+}
+
+const char* host_meminfo_result_name(host_meminfo_result_t res)
+{
+    switch (res) {
+    case HOST_MEMINFO_APPLIED:
+        return "applied";
+    case HOST_MEMINFO_NOT_LOWER:
+        return "not lower";
+    case HOST_MEMINFO_MISSING:
+        return "missing";
+    case HOST_MEMINFO_INVALID:
+        return "invalid";
+    case HOST_MEMINFO_STALE:
+        return "stale";
+    }
+    return "?";
+}
+
+/* Overlay the --host-meminfo file's contents (in buf) onto `m`, read from
+ * /proc/meminfo. The file holds, in /proc/meminfo's format:
+ *
+ *   MemTotal:     <the enforcing limit> kB
+ *   MemAvailable: <what can still be allocated under it> kB
+ *   Timestamp:    <unix seconds when it was written>
+ *
+ * A sandbox's own /proc/meminfo can overstate its headroom: under gVisor it
+ * cannot see the memory the sandbox runtime itself is charged, and its
+ * MemTotal is the limit at sandbox start even if the limit was lowered since.
+ * Whichever source reports less headroom wins.
+ */
+host_meminfo_result_t apply_host_meminfo(meminfo_t* m, const char* buf, long long now_s)
+{
+    long long total = get_entry("MemTotal:", buf);
+    long long avail = get_entry("MemAvailable:", buf);
+    long long ts = get_entry("Timestamp:", buf);
+    if (total <= 0 || avail < 0 || avail > total || ts <= 0) {
+        return HOST_MEMINFO_INVALID;
+    }
+    if (now_s - ts > HOST_MEMINFO_MAX_AGE_S || ts - now_s > HOST_MEMINFO_MAX_AGE_S) {
+        return HOST_MEMINFO_STALE;
+    }
+    double percent = (double)avail * 100 / (double)total;
+    if (percent >= m->MemAvailablePercent) {
+        return HOST_MEMINFO_NOT_LOWER;
+    }
+    m->MemAvailableKiB = avail;
+    m->UserMemTotalKiB = total;
+    m->MemAvailablePercent = percent;
+    m->host_limited = true;
+    return HOST_MEMINFO_APPLIED;
+}
+
+/* Read host_meminfo_path and apply it to `m`. The file is reopened on every
+ * call: its writer replaces it by rename, and a descriptor kept open would go
+ * on reading the replaced file. Changes between a usable and an unusable file
+ * are logged once each, not on every poll. */
+static void apply_host_meminfo_file(meminfo_t* m)
+{
+    static bool usable = true;
+    char buf[1024] = { 0 };
+    host_meminfo_result_t res = HOST_MEMINFO_MISSING;
+
+    FILE* f = fopen(host_meminfo_path, "r");
+    if (f != NULL) {
+        size_t len = fread(buf, 1, sizeof(buf) - 1, f);
+        bool read_error = ferror(f);
+        fclose(f);
+        if (!read_error && len > 0) {
+            res = apply_host_meminfo(m, buf, (long long)time(NULL));
+        }
+    }
+
+    bool now_usable = res == HOST_MEMINFO_APPLIED || res == HOST_MEMINFO_NOT_LOWER;
+    if (usable && !now_usable) {
+        warn("host meminfo %s is %s, using /proc/meminfo alone\n", host_meminfo_path, host_meminfo_result_name(res));
+    } else if (!usable && now_usable) {
+        warn("host meminfo %s is usable again\n", host_meminfo_path);
+    }
+    usable = now_usable;
 }
 
 bool is_alive(int pid)

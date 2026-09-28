@@ -424,21 +424,32 @@ static long long adj_kib(const meminfo_t* m, long long adj)
 // kernel's find_lock_task_mm() does: the thread-group leader's, or, when the
 // leader has exited (a zombie main thread), any live thread's. Returns false
 // if the process is gone or has no mm at all, which is what makes a kernel
-// thread. This holds inside a pid namespace, where pid 2 and its children are
-// ordinary processes.
+// thread, a zombie, or a process that is still exiting. This holds inside a
+// pid namespace, where pid 2 and its children are ordinary processes.
 static bool read_mm_status(int pid, pid_status_t* out)
 {
     if (!parse_proc_pid_status(out, pid)) {
         return false;
     }
-    if (out->has_VmRSS) {
+    if (status_has_mm(out)) {
         return true;
     }
+    const long long threads = out->threads;
     // Room for procdir_path, the task directory and a d_name.
     char path[2 * PATH_LEN] = { 0 };
     snprintf(path, sizeof(path), "%s/%d/task", procdir_path, pid);
     DIR* taskdir = opendir(path);
     if (taskdir == NULL) {
+        if (threads > 1) {
+            // A zombie main thread whose other threads still run: gVisor
+            // fails the task listing with ENOENT once the leader is a zombie,
+            // so the live threads cannot be found. Their memory is unknown,
+            // and the process competes on its oom_score_adj alone.
+            debug("%s: pid %d: zombie main thread with %lld threads and an unlistable task dir, counting its RSS as 0\n",
+                __func__, pid, threads);
+            *out = (pid_status_t) { .has_VmRSS = true, .threads = threads };
+            return true;
+        }
         return false;
     }
     bool found = false;
@@ -448,7 +459,7 @@ static bool read_mm_status(int pid, pid_status_t* out)
             continue;
         }
         snprintf(path, sizeof(path), "%s/%d/task/%s/status", procdir_path, pid, d->d_name);
-        if (parse_proc_pid_status_path(out, path) && out->has_VmRSS) {
+        if (parse_proc_pid_status_path(out, path) && status_has_mm(out)) {
             found = true;
             break;
         }
