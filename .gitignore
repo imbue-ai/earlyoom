@@ -10,3 +10,4 @@
 # generated service files
 /earlyoom.service
 /earlyoom.initscript
+__pycache__/
