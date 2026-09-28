@@ -155,8 +155,10 @@ def main() -> int:
     )
     hog = subprocess.Popen([sys.executable, "-c", hog_code])
 
-    # The controls only need the first kill, or the first signal to the zombie.
-    wanted = len(sleepers) if args.expect == "badness" else 1
+    # The not-badness control only needs the first kill. The zombie ties the
+    # adj-1000 sleeper on adj and loses on RSS, so the zombie-signalled control
+    # keeps going until the zombie's turn comes.
+    wanted = 1 if args.expect == "not-badness" else len(sleepers)
     killed = []
     deadline = time.monotonic() + args.timeout
     try:
