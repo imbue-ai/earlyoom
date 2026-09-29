@@ -9,15 +9,36 @@ the smallest oom_score_adj: ordering by RSS alone (what upstream earlyoom does
 under gVisor, where every oom_score reads 0) kills them in the opposite order
 from the kernel's badness.
 
+It also leaves a zombie at oom_score_adj 1000: a child that exits and is never
+waited for. gVisor prints its Vm* lines as 0 rather than omitting them, so an
+earlyoom that takes a VmRSS line to mean a live mm scores the zombie on its
+adj alone, above every sleeper, and signals it over and over while nothing is
+freed.
+
+One more sleeper holds almost no memory of its own but maps a file this
+process also maps, reading every page, the way each claude process maps the
+one claude binary. gVisor counts the whole mapping in its VmRSS, so ordering
+by VmRSS kills it before the adj-100 sleeper, which frees nothing of the file.
+Ordering by the smaps Anonymous total, which leaves the file out, kills it
+last.
+
 Exit status 0 means the kill order matched --expect:
 
-  badness  every sleeper was killed, in descending badness order
+  badness  every sleeper was killed, in descending badness order counting the
+           smaps Anonymous total (which must differ from the VmRSS order), the
+           zombie was never signalled, and process_mrelease's absence was
+           logged at most once
   not-badness  the first sleeper killed was not the one with the highest
            badness (the control run against upstream earlyoom)
+  zombie-signalled  earlyoom signalled the zombie (the control run against
+           v1.9.0-imbue.2, the release before the zombie fix)
+  vmrss-order  every sleeper was killed in descending badness order counting
+           VmRSS (the control run against v1.9.0-imbue.2 with --no-zombie)
 """
 
 import argparse
 import json
+import mmap
 import os
 import subprocess
 import sys
@@ -29,6 +50,10 @@ HOOK_PATH = "/tmp/earlyoom-hook.sh"
 
 # (oom_score_adj, MiB held). Larger RSS, smaller adj.
 SLEEPERS = ((1000, 10), (900, 30), (500, 60), (300, 80), (100, 100))
+# The file-mapping sleeper's oom_score_adj, and the file's size in MiB.
+MAPPER_ADJ = 150
+MAPPED_FILE_MIB = 96
+MAPPED_FILE = "/tmp/earlyoom-shared-file"
 
 SLEEPER_CODE = """
 import sys, time
@@ -38,6 +63,21 @@ with open("/proc/self/oom_score_adj", "w") as f:
 block = bytearray(mib * 1024 * 1024)
 for i in range(0, len(block), 4096):
     block[i] = 1
+print("ready", flush=True)
+while True:
+    time.sleep(3600)
+"""
+
+
+MAPPER_CODE = """
+import mmap, sys, time
+with open("/proc/self/oom_score_adj", "w") as f:
+    f.write(sys.argv[1])
+with open(sys.argv[2], "rb") as f:
+    mapping = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ)
+total = 0
+for i in range(0, len(mapping), 4096):
+    total += mapping[i]
 print("ready", flush=True)
 while True:
     time.sleep(3600)
@@ -57,12 +97,32 @@ def meminfo_kib(field: str) -> int:
     raise RuntimeError(f"no {field} in /proc/meminfo")
 
 
-def rss_kib(pid: int) -> int:
+def status_kib(pid: int) -> dict[str, int]:
+    fields = {}
     with open(f"/proc/{pid}/status") as f:
         for line in f:
-            if line.startswith("VmRSS:"):
-                return int(line.split()[1])
-    return 0
+            name, _, rest = line.partition(":")
+            if rest.strip().endswith("kB"):
+                fields[name] = int(rest.split()[0])
+    return fields
+
+
+def rss_kib(pid: int, source: str) -> int:
+    """The resident memory the badness counts: VmRSS, or the smaps Anonymous
+    total, which the fork counts where status has no RssAnon (gVisor)."""
+    status = status_kib(pid)
+    if source == "vmrss" or "RssAnon" in status:
+        return status.get("VmRSS", 0)
+    with open(f"/proc/{pid}/smaps") as f:
+        return sum(int(line.split()[1]) for line in f if line.startswith("Anonymous:"))
+
+
+def hook_pids() -> list[int]:
+    """The pids earlyoom has signalled so far, one entry per signal."""
+    if not os.path.exists(HOOK_LOG):
+        return []
+    with open(HOOK_LOG) as f:
+        return [int(line.split()[0]) for line in f if line.split()]
 
 
 def badness_kib(adj: int, rss: int, total_kib: int) -> int:
@@ -72,7 +132,10 @@ def badness_kib(adj: int, rss: int, total_kib: int) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--earlyoom", required=True)
-    parser.add_argument("--expect", choices=("badness", "not-badness"), required=True)
+    parser.add_argument(
+        "--expect", choices=("badness", "not-badness", "zombie-signalled", "vmrss-order"), required=True
+    )
+    parser.add_argument("--no-zombie", action="store_true", help="Leave no zombie (for the vmrss-order control)")
     parser.add_argument("--timeout", type=float, default=240)
     args = parser.parse_args()
 
@@ -86,6 +149,23 @@ def main() -> int:
         )
     os.chmod(HOOK_PATH, 0o755)
 
+    # Forked before earlyoom starts and never waited for, so it stays a zombie
+    # for the whole run.
+    zombie_pid = None
+    if not args.no_zombie:
+        zombie_pid = os.fork()
+        if zombie_pid == 0:
+            set_own_adj(1000)
+            os._exit(0)
+        print(f"zombie pid {zombie_pid}", flush=True)
+
+    # Mapped here for the whole run, so killing the mapper frees none of it.
+    with open(MAPPED_FILE, "wb") as f:
+        f.write(os.urandom(MAPPED_FILE_MIB * MIB))
+    with open(MAPPED_FILE, "rb") as f:
+        shared = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ)
+    sum(shared[i] for i in range(0, len(shared), 4096))
+
     total_kib = meminfo_kib("MemTotal") + meminfo_kib("SwapTotal")
     print(f"MemTotal+SwapTotal: {total_kib // 1024} MiB", flush=True)
 
@@ -98,22 +178,26 @@ def main() -> int:
     time.sleep(1)
 
     sleepers = {}
-    for adj, mib in SLEEPERS:
-        proc = subprocess.Popen(
-            [sys.executable, "-c", SLEEPER_CODE, str(adj), str(mib)],
-            stdout=subprocess.PIPE,
-            text=True,
-        )
+    commands = [[sys.executable, "-c", SLEEPER_CODE, str(adj), str(mib)] for adj, mib in SLEEPERS]
+    commands.append([sys.executable, "-c", MAPPER_CODE, str(MAPPER_ADJ), MAPPED_FILE])
+    for command in commands:
+        adj = int(command[3])
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, text=True)
         assert proc.stdout is not None
         if proc.stdout.readline().strip() != "ready":
             raise RuntimeError(f"sleeper adj={adj} did not start")
         sleepers[proc.pid] = (proc, adj)
 
-    predicted = sorted(
-        ((badness_kib(adj, rss_kib(pid), total_kib), pid, adj) for pid, (_, adj) in sleepers.items()),
-        reverse=True,
-    )
-    print("predicted order (badness KiB, pid, adj):", predicted, flush=True)
+    predictions = {
+        source: sorted(
+            ((badness_kib(adj, rss_kib(pid, source), total_kib), pid, adj) for pid, (_, adj) in sleepers.items()),
+            reverse=True,
+        )
+        for source in ("smaps_anonymous", "vmrss")
+    }
+    for source, prediction in predictions.items():
+        print(f"predicted order counting {source} (badness KiB, pid, adj):", prediction, flush=True)
+    predicted = predictions["vmrss" if args.expect == "vmrss-order" else "smaps_anonymous"]
 
     # The hog grows in small steps and never pauses. earlyoom picks one victim
     # at a time because it waits for each to exit, and the freed memory must
@@ -130,12 +214,16 @@ def main() -> int:
     )
     hog = subprocess.Popen([sys.executable, "-c", hog_code])
 
-    # The control only needs the first kill.
-    wanted = len(sleepers) if args.expect == "badness" else 1
+    # The not-badness control only needs the first kill. The zombie ties the
+    # adj-1000 sleeper on adj and loses on RSS, so the zombie-signalled control
+    # keeps going until the zombie's turn comes.
+    wanted = 1 if args.expect == "not-badness" else len(sleepers)
     killed = []
     deadline = time.monotonic() + args.timeout
     try:
         while len(killed) < wanted and time.monotonic() < deadline and hog.poll() is None:
+            if args.expect == "zombie-signalled" and zombie_pid in hook_pids():
+                break
             for pid, (proc, adj) in sleepers.items():
                 if proc.poll() is not None and pid not in {k for k, _ in killed}:
                     killed.append((pid, adj))
@@ -147,24 +235,59 @@ def main() -> int:
             proc.kill()
         earlyoom.kill()
         earlyoom_log.close()
+        shared.close()
+        os.unlink(MAPPED_FILE)
 
     with open("/tmp/earlyoom.log") as f:
-        print("--- earlyoom log ---\n" + f.read(), flush=True)
+        earlyoom_output = f.read()
+    print("--- earlyoom log ---\n" + earlyoom_output, flush=True)
     hook_lines = open(HOOK_LOG).read().splitlines() if os.path.exists(HOOK_LOG) else []
     print("--- hook log ---\n" + "\n".join(hook_lines), flush=True)
 
     predicted_adjs = [adj for _, _, adj in predicted]
     killed_adjs = [adj for _, adj in killed]
-    verdict = {"expect": args.expect, "predicted_adjs": predicted_adjs, "killed_adjs": killed_adjs}
+    zombie_signals = hook_pids().count(zombie_pid) if zombie_pid is not None else 0
+    mrelease_lines = [line for line in earlyoom_output.splitlines() if "process_mrelease" in line]
+    verdict = {
+        "expect": args.expect,
+        "predicted_adjs": predicted_adjs,
+        "vmrss_predicted_adjs": [adj for _, _, adj in predictions["vmrss"]],
+        "killed_adjs": killed_adjs,
+        "zombie_signals": zombie_signals,
+        "mrelease_lines": len(mrelease_lines),
+    }
     print(json.dumps(verdict), flush=True)
 
+    if args.expect == "zombie-signalled":
+        if zombie_signals == 0:
+            print("FAIL: the control never signalled the zombie", flush=True)
+            return 1
+        return 0
+    if zombie_signals:
+        print(f"FAIL: earlyoom signalled the zombie {zombie_signals} time(s)", flush=True)
+        return 1
+
+    if args.expect == "vmrss-order":
+        if killed_adjs != predicted_adjs:
+            print("FAIL: the control's kill order does not follow the VmRSS badness", flush=True)
+            return 1
+        return 0
     if args.expect == "badness":
+        if verdict["vmrss_predicted_adjs"] == predicted_adjs:
+            print("FAIL: counting VmRSS predicts the same order, so the run cannot tell them apart", flush=True)
+            return 1
         if killed_adjs != predicted_adjs:
             print("FAIL: kill order does not follow badness", flush=True)
             return 1
         orderings = {line.split()[-1] for line in hook_lines if line.split()}
         if orderings != {"kernel_badness"}:
             print(f"FAIL: hook saw orderings {orderings}", flush=True)
+            return 1
+        if "badness counts resident memory from: smaps_anonymous" not in earlyoom_output:
+            print("FAIL: earlyoom does not count the smaps Anonymous total under runsc", flush=True)
+            return 1
+        if len(mrelease_lines) > 1:
+            print(f"FAIL: process_mrelease logged {len(mrelease_lines)} times", flush=True)
             return 1
         return 0
     if not killed_adjs:

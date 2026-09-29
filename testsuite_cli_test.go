@@ -1,13 +1,17 @@
 package earlyoom_testsuite
 
 import (
+	"bufio"
 	"fmt"
 	"io/ioutil"
 	"math"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 type cliTestCase struct {
@@ -143,6 +147,10 @@ func TestCli(t *testing.T) {
 		{args: []string{"-s", "12.34"}, code: -1, stderrContains: "swap free <= 12.34%", stdoutContains: memReport},
 		// Use both -m/-M
 		{args: []string{"-m", "10", "-M", mem1percent}, code: -1, stderrContains: "SIGTERM when mem avail <=  1.00%", stdoutContains: memReport},
+		// earlyoom runs in /proc, so a relative --host-meminfo path would resolve there
+		{args: []string{"--host-meminfo", "host-meminfo"}, code: 13, stderrContains: "is not an absolute path", stdoutEmpty: true},
+		// A missing file is not fatal: /proc/meminfo alone still protects the machine
+		{args: []string{"--host-meminfo", "/nonexistent/host-meminfo"}, code: -1, stderrContains: "is missing, using /proc/meminfo alone", stdoutContains: memReport},
 	}
 	if swapTotal > 0 {
 		// Tests that cannot work when there is no swap enabled
@@ -214,4 +222,46 @@ func TestRss(t *testing.T) {
 		t.Errorf("rss above %d kiB", rssMaxKiB)
 	}
 	t.Logf("earlyoom RSS: %d kiB", res.rss)
+}
+
+// A fresh --host-meminfo file reporting 1 % available makes earlyoom act even
+// though the machine's own /proc/meminfo shows plenty. "-s 100" takes swap out
+// of the decision, since the machine running the test may have free swap.
+func TestHostMeminfoTriggersKill(t *testing.T) {
+	memTotal, _ := parseMeminfo()
+	path := filepath.Join(t.TempDir(), "host-meminfo")
+	content := fmt.Sprintf("MemTotal: %d kB\nMemAvailable: %d kB\nTimestamp: %d\n", memTotal, memTotal/100, time.Now().Unix())
+	if err := ioutil.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(earlyoomBinary, "--dryrun", "-r", "0", "-s", "100", "--host-meminfo", path)
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Process.Kill()
+	timer := time.AfterFunc(10*time.Second, func() { cmd.Process.Kill() })
+	defer timer.Stop()
+
+	var seen []string
+	sawHostLine := false
+	scanner := bufio.NewScanner(stderr)
+	for scanner.Scan() {
+		line := scanner.Text()
+		seen = append(seen, line)
+		if strings.HasPrefix(line, "mem avail below is from host meminfo ") {
+			sawHostLine = true
+		}
+		if strings.HasPrefix(line, "dryrun, not actually sending any signal") {
+			if !sawHostLine {
+				t.Errorf("earlyoom acted without saying the host meminfo drove it:\n%s", strings.Join(seen, "\n"))
+			}
+			return
+		}
+	}
+	t.Errorf("earlyoom never acted on the host meminfo:\n%s", strings.Join(seen, "\n"))
 }

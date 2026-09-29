@@ -176,8 +176,17 @@ type mockProcProcess struct {
 	zombieLeader bool
 	// gvisor writes status the way gVisor does: no VmSwap or VmPTE lines.
 	gvisor bool
+	// gvisorNoMm writes status the way gVisor does for a task that has lost
+	// its mm (a zombie, or a task still exiting): every Vm* line reads 0. No
+	// task directory is written, as gVisor cannot list a zombie leader's.
+	gvisorNoMm bool
 	// noAdj omits oom_score_adj.
 	noAdj bool
+	// smapsAnonKiB is the Anonymous total in smaps. gVisor's VmRSS counts
+	// whole mapped ranges, so it can be far above this. Zero means VmRSSkiB.
+	smapsAnonKiB int
+	// noSmaps omits smaps.
+	noSmaps bool
 }
 
 func (m *mockProcProcess) toProcinfo_t() (p C.procinfo_t) {
@@ -194,7 +203,9 @@ func (m *mockProcProcess) toProcinfo_t() (p C.procinfo_t) {
 // earlyoom reads are included.
 func (m *mockProcProcess) statusContent(omitVm bool) string {
 	s := fmt.Sprintf("Name:\t%s\nState:\t%s\nPid:\t%d\nPPid:\t%d\n", m.comm, m.state, m.pid, m.ppid)
-	if !omitVm {
+	if m.gvisorNoMm {
+		s += "VmSize:\t0 kB\nVmRSS:\t0 kB\nVmData:\t0 kB\n"
+	} else if !omitVm {
 		s += fmt.Sprintf("VmPeak:\t%d kB\nVmSize:\t%d kB\nVmHWM:\t%d kB\nVmRSS:\t%d kB\n",
 			m.VmRSSkiB*2, m.VmRSSkiB*2, m.VmRSSkiB, m.VmRSSkiB)
 		if !m.gvisor {
@@ -203,6 +214,24 @@ func (m *mockProcProcess) statusContent(omitVm bool) string {
 	}
 	s += fmt.Sprintf("Threads:\t%d\n", m.num_threads)
 	return s
+}
+
+// smapsContent renders /proc/$pid/smaps: a file mapping that holds the part
+// of VmRSS that is not anonymous, and the anonymous memory split between the
+// heap and an anonymous mapping. Only the lines around Anonymous are included.
+func (m *mockProcProcess) smapsContent() string {
+	anon := m.smapsAnonKiB
+	if anon == 0 {
+		anon = m.VmRSSkiB
+	}
+	vma := func(header string, rss, anon int) string {
+		return fmt.Sprintf("%s\nSize:\t%d kB\nRss:\t%d kB\nPss:\t%d kB\nAnonymous:\t%d kB\nAnonHugePages:\t0 kB\nSwap:\t0 kB\n",
+			header, rss, rss, rss, anon)
+	}
+	heap := anon / 2
+	return vma("55d5c0a00000-55d5c0c00000 r-xp 00000000 00:31 1234 /usr/bin/"+m.comm, m.VmRSSkiB-anon, 0) +
+		vma("55d5c1000000-55d5d1000000 rw-p 00000000 00:00 0 [heap]", heap, heap) +
+		vma("7f3a00000000-7f3a40000000 rw-p 00000000 00:00 0", anon-heap, anon-heap)
 }
 
 func writeFile(t testing.TB, path string, content string) {
@@ -242,7 +271,7 @@ func mockProc(t testing.TB, procs []mockProcProcess) {
 		// rss = 2nd field, in pages. The other fields are not used by earlyoom.
 		rss := p.VmRSSkiB * 1024 / os.Getpagesize()
 		statRss := rss
-		if p.noMm || p.zombieLeader {
+		if p.noMm || p.zombieLeader || p.gvisorNoMm {
 			statRss = 0
 		}
 		writeFile(t, pidDir+"/statm", fmt.Sprintf("1 %d 3 4 5 6 7\n", statRss))
@@ -265,6 +294,9 @@ func mockProc(t testing.TB, procs []mockProcProcess) {
 			live := p
 			live.state = "S"
 			writeFile(t, taskDir+"/status", live.statusContent(false))
+		}
+		if !p.noSmaps && !p.noMm && !p.gvisorNoMm {
+			writeFile(t, pidDir+"/smaps", p.smapsContent())
 		}
 		// oom_score
 		writeFile(t, pidDir+"/oom_score", fmt.Sprintf("%d\n", p.oom_score))

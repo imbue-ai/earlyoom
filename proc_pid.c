@@ -118,9 +118,12 @@ static bool parse_status_field_kib(const char* buf, const char* name, bool* pres
 
 // Parse a buffer that contains the text from /proc/$pid/status. Example
 // excerpt:
+//   VmSize:	   20480 kB
 //   VmRSS:	    8240 kB
+//   RssAnon:	    6120 kB
 //   VmPTE:	      64 kB
 //   VmSwap:	       0 kB
+//   Threads:	1
 // Returns false if one of these lines is present but does not parse.
 bool parse_proc_pid_status_buf(pid_status_t* out, const char* buf)
 {
@@ -129,14 +132,37 @@ bool parse_proc_pid_status_buf(pid_status_t* out, const char* buf)
     if (!parse_status_field_kib(buf, "VmRSS:", &res.has_VmRSS, &res.VmRSSkiB)) {
         return false;
     }
+    long long rss_anon = 0;
+    if (!parse_status_field_kib(buf, "RssAnon:", &res.has_RssAnon, &rss_anon)) {
+        return false;
+    }
     if (!parse_status_field_kib(buf, "VmSwap:", &present, &res.VmSwapkiB)) {
         return false;
     }
     if (!parse_status_field_kib(buf, "VmPTE:", &present, &res.VmPTEkiB)) {
         return false;
     }
+    if (!parse_status_field_kib(buf, "VmSize:", &res.has_VmSize, &res.VmSizekiB)) {
+        return false;
+    }
+    if (!parse_status_field_kib(buf, "Threads:", &present, &res.threads)) {
+        return false;
+    }
     *out = res;
     return true;
+}
+
+// status_has_mm reports whether the task behind `status` still has an mm.
+// Linux omits the Vm* lines for a task without one. gVisor prints them all
+// as 0 instead: for a zombie, and also for a task that is still exiting,
+// because it releases the mm before the task turns into a zombie. A live
+// task always maps something (its stack, the vDSO), so its VmSize is never 0.
+bool status_has_mm(const pid_status_t* status)
+{
+    if (!status->has_VmRSS) {
+        return false;
+    }
+    return !(status->has_VmSize && status->VmSizekiB == 0);
 }
 
 // Read and parse the status file at `path`. Returns true on success, false
@@ -165,4 +191,54 @@ bool parse_proc_pid_status(pid_status_t* out, int pid)
     char path[256] = { 0 };
     snprintf(path, sizeof(path), "%s/%d/status", procdir_path, pid);
     return parse_proc_pid_status_path(out, path);
+}
+
+// Sum the Anonymous lines of the smaps file at `path` into `out`, in KiB.
+// Returns false if the file cannot be read or a line does not parse (usually:
+// the process is gone).
+bool parse_proc_pid_smaps_anon_path(long long* out, const char* path)
+{
+    FILE* f = fopen(path, "r");
+    if (f == NULL) {
+        return false;
+    }
+    // A mapping's header line can be longer than the buffer (it ends in a
+    // path). Only a chunk that starts a line may be taken for a field.
+    char buf[512];
+    bool at_line_start = true;
+    bool ok = true;
+    long long sum = 0;
+    const char name[] = "Anonymous:";
+    while (fgets(buf, sizeof(buf), f) != NULL) {
+        bool starts_line = at_line_start;
+        at_line_start = strchr(buf, '\n') != NULL;
+        if (!starts_line || strncmp(buf, name, sizeof(name) - 1) != 0) {
+            continue;
+        }
+        char* end = NULL;
+        errno = 0;
+        long long val = strtoll(buf + sizeof(name) - 1, &end, 10);
+        if (errno != 0 || end == buf + sizeof(name) - 1) {
+            ok = false;
+            break;
+        }
+        sum += val;
+    }
+    if (ferror(f)) {
+        ok = false;
+    }
+    fclose(f);
+    if (ok) {
+        *out = sum;
+    }
+    return ok;
+}
+
+// Sum the Anonymous lines of /proc/$pid/smaps, see
+// parse_proc_pid_smaps_anon_path().
+bool parse_proc_pid_smaps_anon(long long* out, int pid)
+{
+    char path[256] = { 0 };
+    snprintf(path, sizeof(path), "%s/%d/smaps", procdir_path, pid);
+    return parse_proc_pid_smaps_anon_path(out, path);
 }

@@ -480,29 +480,192 @@ func Test_is_larger_zombie_main_thread(t *testing.T) {
 	}
 }
 
+// gVisor prints every Vm* line as 0 for a task without an mm instead of
+// omitting them. A single-threaded zombie or exiting task frees nothing when
+// killed, so it must not be chosen however high its oom_score_adj: choosing
+// it made earlyoom signal the same dead pid in a loop while memory ran out.
+// A zombie leader whose other threads still run is kept, on its adj alone,
+// because gVisor cannot list its task directory to find their memory.
+func Test_is_larger_gvisor_task_without_mm(t *testing.T) {
+	procs := []mockProcProcess{
+		{pid: 100, oom_score_adj: 0, VmRSSkiB: 50000, gvisor: true},
+		{pid: 200, oom_score_adj: 931, state: "Z", gvisorNoMm: true},
+		{pid: 300, oom_score_adj: 931, state: "R", gvisorNoMm: true},
+		{pid: 400, oom_score_adj: 500, state: "Z", num_threads: 2, gvisorNoMm: true},
+	}
+	mockProc(t, procs)
+	defer procdir_path("/proc")
+
+	m := meminfo_t(testMemTotalKiB, 0)
+	for _, rssSource := range []_Ctype_rss_source_t{rssSourceVmrss, rssSourceSmapsAnonymous} {
+		t.Run(rss_source_name(rssSource), func(t *testing.T) {
+			args := badness_poll_loop_args_t(rssSource)
+			for _, tc := range []struct {
+				proc     mockProcProcess
+				eligible bool
+			}{{procs[0], true}, {procs[1], false}, {procs[2], false}, {procs[3], true}} {
+				if _, have := candidate(&args, &m, tc.proc); have != tc.eligible {
+					t.Errorf("pid %d: eligible want=%v have=%v", tc.proc.pid, tc.eligible, have)
+				}
+			}
+			if have := badness(&args, &m, procs[3]); have != 500000 {
+				t.Errorf("pid 400: badness want=500000 have=%d", have)
+			}
+			if v := find_largest_process_with(&args, &m); v.pid != 400 || v.vmRssKiB != 0 {
+				t.Errorf("victim want=400 with 0 KiB, have=%d with %d KiB", v.pid, v.vmRssKiB)
+			}
+		})
+	}
+}
+
+// gVisor's VmRSS counts every page of each range it has mapped, touched or
+// not: anonymous memory in 2 MiB-aligned blocks, and a mapped file in full.
+// Counting the smaps Anonymous total instead, a process that has mapped much
+// but holds little no longer outranks one that really holds its memory.
+func Test_is_larger_gvisor_smaps_anonymous(t *testing.T) {
+	procs := []mockProcProcess{
+		// smallest by smaps Anonymous
+		{pid: 100, VmRSSkiB: 600000, smapsAnonKiB: 20000, gvisor: true},                      // 20000
+		{pid: 101, VmRSSkiB: 60000, gvisor: true},                                            // 60000
+		{pid: 102, oom_score_adj: 100, VmRSSkiB: 300000, smapsAnonKiB: 10000, gvisor: true},  // 110000
+		{pid: 103, oom_score_adj: 100, VmRSSkiB: 150000, smapsAnonKiB: 140000, gvisor: true}, // 240000
+		// largest
+	}
+	mockProc(t, procs)
+	defer procdir_path("/proc")
+
+	m := meminfo_t(testMemTotalKiB, 0)
+	anon := badness_poll_loop_args_t(rssSourceSmapsAnonymous)
+	permute_is_larger(t, &anon, &m, procs)
+	if have := badness(&anon, &m, procs[2]); have != 110000 {
+		t.Errorf("pid 102: badness want=110000 have=%d", have)
+	}
+	if v := find_largest_process_with(&anon, &m); v.pid != 103 {
+		t.Errorf("victim want=103 have=%d", v.pid)
+	}
+
+	// By VmRSS: 60000, 250000, 400000, 600000
+	vmrss := badness_poll_loop_args_t(rssSourceVmrss)
+	permute_is_larger(t, &vmrss, &m, []mockProcProcess{procs[1], procs[3], procs[2], procs[0]})
+}
+
+func Test_parse_proc_pid_smaps_anon_path(t *testing.T) {
+	vma := func(header string, anonKiB int) string {
+		return fmt.Sprintf("%s\nSize:\t2048 kB\nRss:\t2048 kB\nAnonymous:\t%d kB\nAnonHugePages:\t0 kB\n", header, anonKiB)
+	}
+	// A path of this 16-byte text, 16 KB long, has a read-buffer chunk that
+	// starts with "Anonymous:" whatever the (odd) buffer length. It is not a
+	// field and must not be counted.
+	longPath := "/tmp/" + strings.Repeat("Anonymous: 1 kB/", 1000)
+	tcs := []struct {
+		name    string
+		content string
+		ok      bool
+		anonKiB int64
+	}{
+		{"sums every mapping", vma("55d5c1000000-55d5c1400000 rw-p 00000000 00:00 0 [heap]", 1500) +
+			vma("7f3a00000000-7f3a00200000 rw-p 00000000 00:00 0", 548) +
+			vma("7f3a40000000-7f3a40200000 r-xp 00000000 00:31 99 /usr/bin/claude", 0), true, 2048},
+		{"long header line", vma("7f3a00000000-7f3a00200000 r--p 00000000 00:31 99 "+longPath, 7) +
+			vma("7f3a40000000-7f3a40200000 rw-p 00000000 00:00 0", 5), true, 12},
+		{"no mappings", "", true, 0},
+		{"garbage", "Anonymous:\tlots kB\n", false, 0},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			path := t.TempDir() + "/smaps"
+			writeFile(t, path, tc.content)
+			ok, have := parse_proc_pid_smaps_anon_path(path)
+			if ok != tc.ok || (ok && have != tc.anonKiB) {
+				t.Errorf("want ok=%v %d KiB, have ok=%v %d KiB", tc.ok, tc.anonKiB, ok, have)
+			}
+		})
+	}
+	if ok, _ := parse_proc_pid_smaps_anon_path(t.TempDir() + "/missing"); ok {
+		t.Error("a missing file parsed")
+	}
+}
+
+// The host's figures replace the sandbox's only when they show less headroom,
+// and only while they are fresh and well-formed.
+func Test_apply_host_meminfo(t *testing.T) {
+	const now = 1790000000
+	host := func(total, avail, ts int64) string {
+		return fmt.Sprintf("MemTotal:       %d kB\nMemAvailable:   %d kB\nTimestamp:      %d\n", total, avail, ts)
+	}
+	tcs := []struct {
+		name    string
+		buf     string
+		want    hostMeminfoResult
+		percent float64
+	}{
+		{"lower", host(1000000, 80000, now), hostMeminfoApplied, 8},
+		{"higher", host(1000000, 600000, now), hostMeminfoNotLower, 50},
+		{"equal", host(1000000, 500000, now), hostMeminfoNotLower, 50},
+		{"just fresh", host(1000000, 80000, now-hostMeminfoMaxAgeSec), hostMeminfoApplied, 8},
+		{"old", host(1000000, 80000, now-hostMeminfoMaxAgeSec-1), hostMeminfoStale, 50},
+		{"future", host(1000000, 80000, now+hostMeminfoMaxAgeSec+1), hostMeminfoStale, 50},
+		{"no timestamp", "MemTotal: 1000000 kB\nMemAvailable: 80000 kB\n", hostMeminfoInvalid, 50},
+		{"no MemAvailable", "MemTotal: 1000000 kB\nTimestamp: 1790000000\n", hostMeminfoInvalid, 50},
+		{"avail above total", host(1000000, 1000001, now), hostMeminfoInvalid, 50},
+		{"zero total", host(0, 0, now), hostMeminfoInvalid, 50},
+		{"empty", "", hostMeminfoInvalid, 50},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			m := sandboxMeminfo(1000000, 450000, 900000)
+			res := apply_host_meminfo(&m, tc.buf, now)
+			if res != tc.want {
+				t.Errorf("result want=%s have=%s", host_meminfo_result_name(tc.want), host_meminfo_result_name(res))
+			}
+			if float64(m.MemAvailablePercent) != tc.percent {
+				t.Errorf("MemAvailablePercent want=%v have=%v", tc.percent, m.MemAvailablePercent)
+			}
+			if bool(m.host_limited) != (tc.want == hostMeminfoApplied) {
+				t.Errorf("host_limited=%v", m.host_limited)
+			}
+			if m.MemTotalKiB != 1000000 {
+				t.Errorf("MemTotalKiB changed to %d", m.MemTotalKiB)
+			}
+			if tc.want == hostMeminfoApplied && (m.MemAvailableKiB != 80000 || m.UserMemTotalKiB != 1000000) {
+				t.Errorf("have avail=%d of %d KiB, want the host's 80000 of 1000000", m.MemAvailableKiB, m.UserMemTotalKiB)
+			}
+		})
+	}
+}
+
 // The startup self-check picks upstream_fallback when an input of the badness
-// cannot be read.
+// cannot be read. Otherwise it picks where the badness reads resident memory
+// from: a Linux status has RssAnon, and VmRSS is what the kernel counts.
+// gVisor's has none, and the smaps Anonymous total is counted instead, as long
+// as earlyoom can read its own smaps.
 func Test_select_ordering(t *testing.T) {
 	self := os.Getpid()
 	tcs := []struct {
-		name string
-		self mockProcProcess
-		m    _Ctype_meminfo_t
-		want _Ctype_ordering_t
+		name          string
+		self          mockProcProcess
+		m             _Ctype_meminfo_t
+		want          _Ctype_ordering_t
+		wantRssSource _Ctype_rss_source_t
 	}{
-		{"all readable", mockProcProcess{pid: self, VmRSSkiB: 1000}, meminfo_t(testMemTotalKiB, 0), orderingKernelBadness},
-		{"gVisor status", mockProcProcess{pid: self, VmRSSkiB: 1000, gvisor: true}, meminfo_t(testMemTotalKiB, 0), orderingKernelBadness},
-		{"unreadable adj", mockProcProcess{pid: self, VmRSSkiB: 1000, noAdj: true}, meminfo_t(testMemTotalKiB, 0), orderingUpstreamFallback},
-		{"no VmRSS", mockProcProcess{pid: self, noMm: true}, meminfo_t(testMemTotalKiB, 0), orderingUpstreamFallback},
-		{"no MemTotal", mockProcProcess{pid: self, VmRSSkiB: 1000}, meminfo_t(0, 0), orderingUpstreamFallback},
+		{"Linux status", mockProcProcess{pid: self, VmRSSkiB: 1000}, meminfo_t(testMemTotalKiB, 0), orderingKernelBadness, rssSourceVmrss},
+		{"gVisor status", mockProcProcess{pid: self, VmRSSkiB: 1000, gvisor: true}, meminfo_t(testMemTotalKiB, 0), orderingKernelBadness, rssSourceSmapsAnonymous},
+		{"gVisor status, no smaps", mockProcProcess{pid: self, VmRSSkiB: 1000, gvisor: true, noSmaps: true}, meminfo_t(testMemTotalKiB, 0), orderingKernelBadness, rssSourceVmrss},
+		{"unreadable adj", mockProcProcess{pid: self, VmRSSkiB: 1000, noAdj: true}, meminfo_t(testMemTotalKiB, 0), orderingUpstreamFallback, 0},
+		{"no VmRSS", mockProcProcess{pid: self, noMm: true}, meminfo_t(testMemTotalKiB, 0), orderingUpstreamFallback, 0},
+		{"no MemTotal", mockProcProcess{pid: self, VmRSSkiB: 1000}, meminfo_t(0, 0), orderingUpstreamFallback, 0},
 	}
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
 			mockProc(t, []mockProcProcess{tc.self})
 			defer procdir_path("/proc")
 			m := tc.m
-			if have := select_ordering(&m); have != tc.want {
+			have, haveRssSource := select_ordering(&m)
+			if have != tc.want {
 				t.Errorf("want=%s have=%s", ordering_name(tc.want), ordering_name(have))
+			}
+			if have == orderingKernelBadness && haveRssSource != tc.wantRssSource {
+				t.Errorf("rss source: want=%s have=%s", rss_source_name(tc.wantRssSource), rss_source_name(haveRssSource))
 			}
 		})
 	}
@@ -617,16 +780,18 @@ func Test_parse_proc_pid_status_buf(t *testing.T) {
 		rss    int64
 		swap   int64
 		pte    int64
+		// Linux prints RssAnon, gVisor does not
+		rssAnon bool
 	}{
-		{"Name:\tbash\nVmRSS:\t  8240 kB\nVmPTE:\t    64 kB\nVmSwap:\t    12 kB\n", true, true, 8240, 12, 64},
+		{"Name:\tbash\nVmRSS:\t  8240 kB\nRssAnon:\t  6120 kB\nVmPTE:\t    64 kB\nVmSwap:\t    12 kB\n", true, true, 8240, 12, 64, true},
 		// gVisor: no VmSwap, no VmPTE
-		{"Name:\tbash\nVmRSS:\t8240 kB\n", true, true, 8240, 0, 0},
+		{"Name:\tbash\nVmRSS:\t8240 kB\n", true, true, 8240, 0, 0, false},
 		// kernel thread: no Vm* lines at all
-		{"Name:\tkthreadd\nState:\tS (sleeping)\nThreads:\t1\n", true, false, 0, 0, 0},
+		{"Name:\tkthreadd\nState:\tS (sleeping)\nThreads:\t1\n", true, false, 0, 0, 0, false},
 		// a process named like a field must not match
-		{"Name:\tVmRSS: 99 kB\nVmRSS:\t7 kB\n", true, true, 7, 0, 0},
-		{"Name:\tbash\nVmRSS:\tgarbage\n", false, false, 0, 0, 0},
-		{"", true, false, 0, 0, 0},
+		{"Name:\tVmRSS: 99 kB\nVmRSS:\t7 kB\n", true, true, 7, 0, 0, false},
+		{"Name:\tbash\nVmRSS:\tgarbage\n", false, false, 0, 0, 0, false},
+		{"", true, false, 0, 0, 0, false},
 	}
 	for _, tc := range tcs {
 		ok, have := parse_proc_pid_status_buf(tc.buf)
@@ -638,8 +803,29 @@ func Test_parse_proc_pid_status_buf(t *testing.T) {
 			continue
 		}
 		if bool(have.has_VmRSS) != tc.hasRss || int64(have.VmRSSkiB) != tc.rss ||
-			int64(have.VmSwapkiB) != tc.swap || int64(have.VmPTEkiB) != tc.pte {
+			int64(have.VmSwapkiB) != tc.swap || int64(have.VmPTEkiB) != tc.pte ||
+			bool(have.has_RssAnon) != tc.rssAnon {
 			t.Errorf("%q: have=%#v", tc.buf, have)
+		}
+	}
+}
+
+func Test_status_has_mm(t *testing.T) {
+	tcs := []struct {
+		buf   string
+		hasMm bool
+	}{
+		{"Name:\tbash\nVmSize:\t20480 kB\nVmRSS:\t8240 kB\nThreads:\t1\n", true},
+		// Linux kernel thread or zombie: no Vm* lines
+		{"Name:\tkthreadd\nState:\tS (sleeping)\nThreads:\t1\n", false},
+		// gVisor zombie, or a task still exiting: every Vm* line reads 0
+		{"Name:\tpulseaudio\nState:\tZ (zombie)\nVmSize:\t0 kB\nVmRSS:\t0 kB\nVmData:\t0 kB\nThreads:\t1\n", false},
+		// A live task whose pages are all swapped out still has a VmSize
+		{"Name:\tidle\nVmSize:\t20480 kB\nVmRSS:\t0 kB\n", true},
+	}
+	for _, tc := range tcs {
+		if have := status_has_mm(tc.buf); have != tc.hasMm {
+			t.Errorf("%q: want=%v have=%v", tc.buf, tc.hasMm, have)
 		}
 	}
 }
