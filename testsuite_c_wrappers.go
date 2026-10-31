@@ -15,6 +15,7 @@ import (
 // #include "kill.h"
 // #include "msg.h"
 // #include "globals.h"
+// #include "host_reclaim.h"
 // #include "proc_pid.h"
 import "C"
 
@@ -302,6 +303,14 @@ func apply_host_meminfo(m *C.meminfo_t, buf string, nowSec int64) hostMeminfoRes
 	cbuf := C.CString(buf)
 	defer C.free(unsafe.Pointer(cbuf))
 	return C.apply_host_meminfo(m, cbuf, C.longlong(nowSec))
+}
+
+func parse_host_reclaim_answer(buf string, outcomeSize int) (int64, string) {
+	cbuf := C.CString(buf)
+	defer C.free(unsafe.Pointer(cbuf))
+	outcome := make([]byte, outcomeSize+1)
+	sequence := C.parse_host_reclaim_answer(cbuf, (*C.char)(unsafe.Pointer(&outcome[0])), C.size_t(outcomeSize))
+	return int64(sequence), C.GoString((*C.char)(unsafe.Pointer(&outcome[0])))
 }
 
 func host_meminfo_result_name(res hostMeminfoResult) string {

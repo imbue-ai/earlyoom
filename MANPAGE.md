@@ -223,6 +223,15 @@ memory than /proc/meminfo. Meant for a file written from outside a sandbox
 whose own /proc/meminfo cannot see all the memory charged to its limit. A file
 that is missing, malformed or more than 5 seconds old is ignored.
 
+#### \-\-host-reclaim-request /PATH, \-\-host-reclaim-result /PATH
+before sending the SIGTERM a \-\-host-meminfo reading calls for, write a new
+sequence number to the request file, wait up to 1.5 seconds for the result
+file to repeat it on a "Sequence:" line, then reread memory and skip the kill
+if it recovered. Meant for a host that reclaims the sandbox's cold file cache
+and republishes the \-\-host-meminfo file before it answers. At most one
+request every 2 seconds; none in SIGKILL range. Both options are needed
+together, with \-\-host-meminfo.
+
 #### -h, \-\-help
 this help text
 
