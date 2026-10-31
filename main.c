@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "globals.h"
+#include "host_reclaim.h"
 #include "kill.h"
 #include "meminfo.h"
 #include "msg.h"
@@ -44,6 +45,8 @@ enum {
     LONG_OPT_USE_SYSLOG,
     LONG_OPT_SORT_BY_RSS,
     LONG_OPT_HOST_MEMINFO,
+    LONG_OPT_HOST_RECLAIM_REQUEST,
+    LONG_OPT_HOST_RECLAIM_RESULT,
 };
 
 static int set_oom_score_adj(int);
@@ -187,6 +190,8 @@ int main(int argc, char* argv[])
         { "sort-by-rss", no_argument, NULL, LONG_OPT_SORT_BY_RSS },
         { "syslog", no_argument, NULL, LONG_OPT_USE_SYSLOG },
         { "host-meminfo", required_argument, NULL, LONG_OPT_HOST_MEMINFO },
+        { "host-reclaim-request", required_argument, NULL, LONG_OPT_HOST_RECLAIM_REQUEST },
+        { "host-reclaim-result", required_argument, NULL, LONG_OPT_HOST_RECLAIM_RESULT },
         { "help", no_argument, NULL, 'h' },
         { "debug", no_argument, NULL, 'd' },
         { 0, 0, NULL, 0 } /* end-of-array marker */
@@ -311,6 +316,18 @@ int main(int argc, char* argv[])
             host_meminfo_path = optarg;
             fprintf(stderr, "Also reading memory headroom from %s\n", host_meminfo_path);
             break;
+        case LONG_OPT_HOST_RECLAIM_REQUEST:
+            if (optarg[0] != '/') {
+                fatal(13, "--host-reclaim-request: '%s' is not an absolute path\n", optarg);
+            }
+            host_reclaim_request_path = optarg;
+            break;
+        case LONG_OPT_HOST_RECLAIM_RESULT:
+            if (optarg[0] != '/') {
+                fatal(13, "--host-reclaim-result: '%s' is not an absolute path\n", optarg);
+            }
+            host_reclaim_result_path = optarg;
+            break;
         case 'h':
             fprintf(stderr,
                 "Usage: %s [OPTION]...\n"
@@ -345,6 +362,11 @@ int main(int argc, char* argv[])
                 "  --host-meminfo /PATH      also read MemTotal, MemAvailable and Timestamp\n"
                 "                            from this file, written from outside a sandbox,\n"
                 "                            and act on it when it reports less headroom\n"
+                "  --host-reclaim-request /PATH\n"
+                "  --host-reclaim-result /PATH\n"
+                "                            before a SIGTERM the host headroom calls for, ask\n"
+                "                            the host to reclaim cold cache through these files\n"
+                "                            and skip the kill if that recovered the headroom\n"
                 "  -h, --help                this help text\n",
                 argv[0]);
             exit(0);
@@ -356,6 +378,16 @@ int main(int argc, char* argv[])
 
     if (optind < argc) {
         fatal(13, "extra argument not understood: '%s'\n", argv[optind]);
+    }
+    if ((host_reclaim_request_path == NULL) != (host_reclaim_result_path == NULL)) {
+        fatal(2, "--host-reclaim-request and --host-reclaim-result go together\n");
+    }
+    if (host_reclaim_request_path != NULL) {
+        if (host_meminfo_path == NULL) {
+            fatal(2, "--host-reclaim-request needs --host-meminfo\n");
+        }
+        fprintf(stderr, "Asking the host to reclaim through %s before shedding, answers in %s\n",
+            host_reclaim_request_path, host_reclaim_result_path);
     }
     // Merge "-M" with "-m" values
     if (have_M) {
@@ -548,6 +580,25 @@ static void poll_loop(const poll_loop_args_t* args)
             print_mem_stats(warn, m);
             warn("low memory! at or below SIGTERM limits: mem " PRIPCT ", swap " PRIPCT "\n",
                 args->mem_term_percent, args->swap_term_percent);
+        }
+        if (sig == SIGTERM && m.host_limited && host_reclaim_request_path != NULL) {
+            /* The host headroom counts only inactive file cache, and the
+             * sandbox cannot drop the rest itself: have the host reclaim
+             * what nothing reads any more before a process goes for it. */
+            char outcome[64] = { 0 };
+            long long waited_ms = 0;
+            host_reclaim_result_t res = ask_host_reclaim(outcome, sizeof(outcome), &waited_ms);
+            if (res == HOST_RECLAIM_ANSWERED) {
+                m = parse_meminfo();
+                sig = lowmem_sig(args, &m);
+                warn("host reclaim: %s after %lld ms, mem avail now %5lld of %5lld MiB (" PRIPCT ")\n", outcome,
+                    waited_ms, m.MemAvailableKiB / 1024, m.UserMemTotalKiB / 1024, m.MemAvailablePercent);
+                if (sig == 0) {
+                    warn("memory situation has recovered after host reclaim\n");
+                }
+            } else if (res == HOST_RECLAIM_FAILED) {
+                warn("host reclaim: %s\n", outcome);
+            }
         }
         if (sig) {
             procinfo_t victim = find_largest_process(args, &m);

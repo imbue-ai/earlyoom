@@ -113,6 +113,22 @@ malformed, or more than 5 seconds old is ignored, and earlyoom logs when that
 starts and stops being the case. The victim's badness still uses the sandbox's
 `MemTotal`.
 
+**`--host-reclaim-request /PATH` and `--host-reclaim-result /PATH`.** The host
+figure may count only cold file cache as available, and a sandbox cannot drop
+cache itself (gVisor has no `drop_caches`). With these options, when the host
+figure calls for a SIGTERM, earlyoom first writes a new sequence number (the
+wall clock in milliseconds) to the request file and waits up to 1.5 s for the
+result file to repeat it:
+
+    Sequence:  <the request's sequence number>
+    Outcome:   <how the host's reclaim round ended>
+    Timestamp: <unix seconds when it was written>
+
+The host is expected to reclaim and republish the `--host-meminfo` file before
+it answers. earlyoom then rereads its figures and skips the kill if they
+recovered. It asks at most once every 2 s, never in SIGKILL range, and with no
+answer it sheds as before. Both options need `--host-meminfo`.
+
 **Releases.** A `v*` tag publishes static binaries for
 `earlyoom-x86_64-unknown-linux` and `earlyoom-aarch64-unknown-linux`, each with
 a `.sha256`. CI also runs the binary under gVisor (`runsc`) with a memory limit

@@ -151,6 +151,10 @@ func TestCli(t *testing.T) {
 		{args: []string{"--host-meminfo", "host-meminfo"}, code: 13, stderrContains: "is not an absolute path", stdoutEmpty: true},
 		// A missing file is not fatal: /proc/meminfo alone still protects the machine
 		{args: []string{"--host-meminfo", "/nonexistent/host-meminfo"}, code: -1, stderrContains: "is missing, using /proc/meminfo alone", stdoutContains: memReport},
+		{args: []string{"--host-reclaim-request", "request", "--host-reclaim-result", "/result"}, code: 13, stderrContains: "is not an absolute path", stdoutEmpty: true},
+		{args: []string{"--host-meminfo", "/nonexistent/host-meminfo", "--host-reclaim-request", "/request"}, code: 2, stderrContains: "go together", stdoutEmpty: true},
+		{args: []string{"--host-reclaim-request", "/request", "--host-reclaim-result", "/result"}, code: 2, stderrContains: "needs --host-meminfo", stdoutEmpty: true},
+		{args: []string{"--host-meminfo", "/nonexistent/host-meminfo", "--host-reclaim-request", "/request", "--host-reclaim-result", "/result"}, code: -1, stderrContains: "Asking the host to reclaim through /request", stdoutContains: memReport},
 	}
 	if swapTotal > 0 {
 		// Tests that cannot work when there is no swap enabled
@@ -264,4 +268,107 @@ func TestHostMeminfoTriggersKill(t *testing.T) {
 		}
 	}
 	t.Errorf("earlyoom never acted on the host meminfo:\n%s", strings.Join(seen, "\n"))
+}
+
+func writeHostMeminfo(t *testing.T, path string, total int64, avail int64) {
+	t.Helper()
+	content := fmt.Sprintf("MemTotal: %d kB\nMemAvailable: %d kB\nTimestamp: %d\n", total, avail, time.Now().Unix())
+	if err := ioutil.WriteFile(path+".new", []byte(content), 0644); err != nil {
+		t.Error(err)
+		return
+	}
+	if err := os.Rename(path+".new", path); err != nil {
+		t.Error(err)
+	}
+}
+
+// runWithHostReclaim runs a --dryrun earlyoom on a host meminfo reporting 8 %
+// available (SIGTERM range, where it asks the host), with
+// --host-reclaim-request and --host-reclaim-result, and
+// returns its stderr up to the first line starting with one of `ends`.
+// `host` plays the host: it is called with the request's content each time
+// earlyoom writes a new one, and may rewrite the meminfo and the answer.
+func runWithHostReclaim(t *testing.T, host func(dir string, request string), ends ...string) []string {
+	memTotal, _ := parseMeminfo()
+	dir := t.TempDir()
+	writeHostMeminfo(t, filepath.Join(dir, "host-meminfo"), int64(memTotal), int64(memTotal*8/100))
+
+	cmd := exec.Command(earlyoomBinary, "--dryrun", "-r", "0", "-s", "100",
+		"--host-meminfo", filepath.Join(dir, "host-meminfo"),
+		"--host-reclaim-request", filepath.Join(dir, "request"),
+		"--host-reclaim-result", filepath.Join(dir, "result"))
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Process.Kill()
+	timer := time.AfterFunc(10*time.Second, func() { cmd.Process.Kill() })
+	defer timer.Stop()
+
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		last := ""
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+			request, err := ioutil.ReadFile(filepath.Join(dir, "request"))
+			if err == nil && string(request) != last && strings.HasSuffix(string(request), "\n") {
+				last = string(request)
+				host(dir, last)
+			}
+		}
+	}()
+
+	var seen []string
+	scanner := bufio.NewScanner(stderr)
+	for scanner.Scan() {
+		line := scanner.Text()
+		seen = append(seen, line)
+		for _, end := range ends {
+			if strings.HasPrefix(line, end) {
+				return seen
+			}
+		}
+	}
+	t.Fatalf("earlyoom ended without any of %q:\n%s", ends, strings.Join(seen, "\n"))
+	return nil
+}
+
+// A host that answers by reclaiming enough to clear the threshold stops the kill.
+func TestHostReclaimAvertsKill(t *testing.T) {
+	memTotal, _ := parseMeminfo()
+	host := func(dir string, request string) {
+		writeHostMeminfo(t, filepath.Join(dir, "host-meminfo"), int64(memTotal), int64(memTotal/2))
+		answer := fmt.Sprintf("Sequence: %20s\nOutcome: %-12s\nTimestamp: %15d\n", strings.TrimSpace(request), "target", time.Now().Unix())
+		if err := ioutil.WriteFile(filepath.Join(dir, "result"), []byte(answer), 0644); err != nil {
+			t.Error(err)
+		}
+	}
+	seen := runWithHostReclaim(t, host, "memory situation has recovered after host reclaim", "dryrun, not actually sending any signal")
+	if !strings.HasPrefix(seen[len(seen)-1], "memory situation has recovered after host reclaim") {
+		t.Errorf("earlyoom went on to kill after the host reclaimed:\n%s", strings.Join(seen, "\n"))
+	}
+	if !strings.HasPrefix(seen[len(seen)-2], "host reclaim: target after ") {
+		t.Errorf("earlyoom did not log the host's answer:\n%s", strings.Join(seen, "\n"))
+	}
+}
+
+// With no answer, earlyoom waits out HOST_RECLAIM_WAIT_MS and sheds as before.
+func TestHostReclaimWithoutAnswerStillKills(t *testing.T) {
+	start := time.Now()
+	seen := runWithHostReclaim(t, func(string, string) {}, "dryrun, not actually sending any signal")
+	joined := strings.Join(seen, "\n")
+	if !strings.Contains(joined, "host reclaim: no answer within 1500 ms") {
+		t.Errorf("earlyoom did not say the host never answered:\n%s", joined)
+	}
+	if elapsed := time.Since(start); elapsed < 1500*time.Millisecond {
+		t.Errorf("earlyoom shed after %v, before the 1500 ms wait was out", elapsed)
+	}
 }

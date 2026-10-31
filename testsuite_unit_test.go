@@ -634,6 +634,36 @@ func Test_apply_host_meminfo(t *testing.T) {
 	}
 }
 
+// An answer counts only once its Outcome line is complete; its outcome may
+// hold spaces and is padded to a fixed width by the host.
+func Test_parse_host_reclaim_answer(t *testing.T) {
+	tcs := []struct {
+		name     string
+		buf      string
+		sequence int64
+		outcome  string
+	}{
+		{"padded", "Sequence: 1793426846123\nOutcome: target      \nTimestamp: 1793426846\n", 1793426846123, "target"},
+		{"space in outcome", "Sequence:                    7\nOutcome: nothing left\n", 7, "nothing left"},
+		{"no Outcome line end", "Sequence: 7\nOutcome: tar", -1, ""},
+		{"no Outcome", "Sequence: 7\n", -1, ""},
+		{"no Sequence", "Outcome: target\n", -1, ""},
+		{"zero Sequence", "Sequence: 0\nOutcome: target\n", -1, ""},
+		{"empty", "", -1, ""},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			sequence, outcome := parse_host_reclaim_answer(tc.buf, 64)
+			if sequence != tc.sequence || (sequence > 0 && outcome != tc.outcome) {
+				t.Errorf("want (%d, %q), have (%d, %q)", tc.sequence, tc.outcome, sequence, outcome)
+			}
+		})
+	}
+	if _, outcome := parse_host_reclaim_answer("Sequence: 7\nOutcome: thrashing\n", 5); outcome != "thra" {
+		t.Errorf("a long outcome was not cut to the buffer: %q", outcome)
+	}
+}
+
 // The startup self-check picks upstream_fallback when an input of the badness
 // cannot be read. Otherwise it picks where the badness reads resident memory
 // from: a Linux status has RssAnon, and VmRSS is what the kernel counts.
