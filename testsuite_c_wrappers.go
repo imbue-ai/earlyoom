@@ -288,6 +288,14 @@ func sandboxMeminfo(memTotalKiB, availKiB, userTotalKiB int64) (m C.meminfo_t) {
 	return
 }
 
+// withSandboxSwap sets the swap figures parse_meminfo() would have read from
+// the sandbox's own /proc/meminfo.
+func withSandboxSwap(m *C.meminfo_t, totalKiB, freeKiB int64) {
+	m.SwapTotalKiB = C.longlong(totalKiB)
+	m.SwapFreeKiB = C.longlong(freeKiB)
+	m.SwapFreePercent = C.double(float64(freeKiB) * 100 / float64(totalKiB))
+}
+
 type hostMeminfoResult = C.host_meminfo_result_t
 
 const (

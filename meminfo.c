@@ -152,10 +152,20 @@ const char* host_meminfo_result_name(host_meminfo_result_t res)
  *   MemAvailable: <what can still be allocated under it> kB
  *   Timestamp:    <unix seconds when it was written>
  *
+ * and optionally, together:
+ *
+ *   SwapTotal:    <the swap the enforcing limit lets the sandbox use> kB
+ *   SwapFree:     <how much of that is still unused> kB
+ *
  * A sandbox's own /proc/meminfo can overstate its headroom: under gVisor it
  * cannot see the memory the sandbox runtime itself is charged, and its
  * MemTotal is the limit at sandbox start even if the limit was lowered since.
- * Whichever source reports less headroom wins.
+ * Whichever source reports less memory headroom wins.
+ *
+ * Swap is different: a container under runc sees the whole host's swap in
+ * /proc/meminfo, not the share its cgroup may use, so when the file carries
+ * both swap lines they replace /proc/meminfo's swap outright, whether or not
+ * the memory figures win. A file without them leaves swap as it was.
  */
 host_meminfo_result_t apply_host_meminfo(meminfo_t* m, const char* buf, long long now_s)
 {
@@ -165,8 +175,26 @@ host_meminfo_result_t apply_host_meminfo(meminfo_t* m, const char* buf, long lon
     if (total <= 0 || avail < 0 || avail > total || ts <= 0) {
         return HOST_MEMINFO_INVALID;
     }
+    long long swap_total = get_entry("SwapTotal:", buf);
+    long long swap_free = get_entry("SwapFree:", buf);
+    bool has_swap_total = swap_total != -ENODATA;
+    bool has_swap_free = swap_free != -ENODATA;
+    if (has_swap_total != has_swap_free) {
+        return HOST_MEMINFO_INVALID;
+    }
+    if (has_swap_total && (swap_total < 0 || swap_free < 0 || swap_free > swap_total)) {
+        return HOST_MEMINFO_INVALID;
+    }
     if (now_s - ts > HOST_MEMINFO_MAX_AGE_S || ts - now_s > HOST_MEMINFO_MAX_AGE_S) {
         return HOST_MEMINFO_STALE;
+    }
+    if (has_swap_total) {
+        m->SwapTotalKiB = swap_total;
+        m->SwapFreeKiB = swap_free;
+        // Same convention as parse_meminfo(): no swap reads as 0% free, so
+        // the swap gate never holds a kill back on a swapless sandbox.
+        m->SwapFreePercent = swap_total > 0 ? (double)swap_free * 100 / (double)swap_total : 0;
+        m->host_swap = true;
     }
     double percent = (double)avail * 100 / (double)total;
     if (percent >= m->MemAvailablePercent) {
