@@ -113,6 +113,18 @@ malformed, or more than 5 seconds old is ignored, and earlyoom logs when that
 starts and stops being the case. The victim's badness still uses the sandbox's
 `MemTotal`.
 
+The file may also carry swap, as a pair of lines:
+
+    SwapTotal:    <the swap the enforcing limit lets the sandbox use> kB
+    SwapFree:     <how much of that is still unused> kB
+
+A container under runc sees the whole host's swap in `/proc/meminfo`, not the
+share its cgroup may use (`memory.swap.max`), so a swap threshold (`-s`) would
+otherwise be measured against the wrong pool. When both lines are present they
+replace `/proc/meminfo`'s swap figures outright, whether or not the memory
+figures win; one without the other makes the file malformed. A file without
+them leaves swap as `/proc/meminfo` reports it.
+
 **Releases.** A `v*` tag publishes static binaries for
 `earlyoom-x86_64-unknown-linux` and `earlyoom-aarch64-unknown-linux`, each with
 a `.sha256`. CI also runs the binary under gVisor (`runsc`) with a memory limit

@@ -634,6 +634,62 @@ func Test_apply_host_meminfo(t *testing.T) {
 	}
 }
 
+// SwapTotal and SwapFree lines in the host file replace the sandbox's swap
+// figures whenever the file is usable, independently of whether the memory
+// figures win; a file without them leaves swap alone, and half a pair or an
+// impossible pair makes the file invalid.
+func Test_apply_host_meminfo_swap(t *testing.T) {
+	const now = 1790000000
+	const sandboxSwapTotal, sandboxSwapFree = 36000000, 30000000
+	withSwap := func(avail, swapTotal, swapFree, ts int64) string {
+		return fmt.Sprintf("MemTotal: 1000000 kB\nMemAvailable: %d kB\nSwapTotal: %d kB\nSwapFree: %d kB\nTimestamp: %d\n",
+			avail, swapTotal, swapFree, ts)
+	}
+	tcs := []struct {
+		name        string
+		buf         string
+		want        hostMeminfoResult
+		hostSwap    bool
+		swapTotal   int64
+		swapFree    int64
+		swapPercent float64
+	}{
+		{"mem lower, swap applied", withSwap(80000, 4000000, 1000000, now), hostMeminfoApplied, true, 4000000, 1000000, 25},
+		{"mem not lower, swap still applied", withSwap(600000, 4000000, 3000000, now), hostMeminfoNotLower, true, 4000000, 3000000, 75},
+		{"swap full", withSwap(80000, 4000000, 0, now), hostMeminfoApplied, true, 4000000, 0, 0},
+		{"no swap allowed reads as 0%", withSwap(80000, 0, 0, now), hostMeminfoApplied, true, 0, 0, 0},
+		{"no swap lines leaves swap", "MemTotal: 1000000 kB\nMemAvailable: 80000 kB\nTimestamp: 1790000000\n",
+			hostMeminfoApplied, false, sandboxSwapTotal, sandboxSwapFree, 100 * float64(sandboxSwapFree) / sandboxSwapTotal},
+		{"SwapTotal alone", "MemTotal: 1000000 kB\nMemAvailable: 80000 kB\nSwapTotal: 4000000 kB\nTimestamp: 1790000000\n",
+			hostMeminfoInvalid, false, sandboxSwapTotal, sandboxSwapFree, 100 * float64(sandboxSwapFree) / sandboxSwapTotal},
+		{"SwapFree alone", "MemTotal: 1000000 kB\nMemAvailable: 80000 kB\nSwapFree: 4000000 kB\nTimestamp: 1790000000\n",
+			hostMeminfoInvalid, false, sandboxSwapTotal, sandboxSwapFree, 100 * float64(sandboxSwapFree) / sandboxSwapTotal},
+		{"free above total", withSwap(80000, 4000000, 4000001, now), hostMeminfoInvalid, false,
+			sandboxSwapTotal, sandboxSwapFree, 100 * float64(sandboxSwapFree) / sandboxSwapTotal},
+		{"stale file leaves swap", withSwap(80000, 4000000, 0, now-hostMeminfoMaxAgeSec-1), hostMeminfoStale, false,
+			sandboxSwapTotal, sandboxSwapFree, 100 * float64(sandboxSwapFree) / sandboxSwapTotal},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			m := sandboxMeminfo(1000000, 450000, 900000)
+			withSandboxSwap(&m, sandboxSwapTotal, sandboxSwapFree)
+			res := apply_host_meminfo(&m, tc.buf, now)
+			if res != tc.want {
+				t.Errorf("result want=%s have=%s", host_meminfo_result_name(tc.want), host_meminfo_result_name(res))
+			}
+			if bool(m.host_swap) != tc.hostSwap {
+				t.Errorf("host_swap want=%v have=%v", tc.hostSwap, m.host_swap)
+			}
+			if int64(m.SwapTotalKiB) != tc.swapTotal || int64(m.SwapFreeKiB) != tc.swapFree {
+				t.Errorf("swap want %d free of %d KiB, have %d of %d", tc.swapFree, tc.swapTotal, m.SwapFreeKiB, m.SwapTotalKiB)
+			}
+			if float64(m.SwapFreePercent) != tc.swapPercent {
+				t.Errorf("SwapFreePercent want=%v have=%v", tc.swapPercent, m.SwapFreePercent)
+			}
+		})
+	}
+}
+
 // The startup self-check picks upstream_fallback when an input of the badness
 // cannot be read. Otherwise it picks where the badness reads resident memory
 // from: a Linux status has RssAnon, and VmRSS is what the kernel counts.

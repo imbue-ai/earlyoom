@@ -25,6 +25,9 @@ typedef struct {
     // from the --host-meminfo file, because it reported less headroom than
     // /proc/meminfo. MemTotalKiB always stays the /proc/meminfo value.
     bool host_limited;
+    // True when SwapTotalKiB, SwapFreeKiB and SwapFreePercent come from the
+    // --host-meminfo file, which carried SwapTotal and SwapFree lines.
+    bool host_swap;
 } meminfo_t;
 
 // A --host-meminfo file older than this is ignored: whatever writes it has

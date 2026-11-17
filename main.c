@@ -344,7 +344,9 @@ int main(int argc, char* argv[])
                 "  --syslog                  use syslog instead of std streams\n"
                 "  --host-meminfo /PATH      also read MemTotal, MemAvailable and Timestamp\n"
                 "                            from this file, written from outside a sandbox,\n"
-                "                            and act on it when it reports less headroom\n"
+                "                            and act on it when it reports less headroom;\n"
+                "                            SwapTotal and SwapFree lines, when present,\n"
+                "                            replace the swap figures from /proc/meminfo\n"
                 "  -h, --help                this help text\n",
                 argv[0]);
             exit(0);
@@ -539,6 +541,9 @@ static void poll_loop(const poll_loop_args_t* args)
         int sig = lowmem_sig(args, &m);
         if (sig && m.host_limited) {
             warn("mem avail below is from host meminfo %s\n", host_meminfo_path);
+        }
+        if (sig && m.host_swap) {
+            warn("swap free below is from host meminfo %s\n", host_meminfo_path);
         }
         if (sig == SIGKILL) {
             print_mem_stats(warn, m);
